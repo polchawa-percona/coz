@@ -24,6 +24,7 @@ public:
   size_t slowdown_debt_in = 0;          //< coz-mcp: slowdown owed for samples taken inside a lock
   size_t slowdown_debt_out = 0;         //< coz-mcp: slowdown owed for samples taken outside locks
   size_t slowdown_epoch = 0;            //< coz-mcp: experiment the debts belong to
+  size_t overshoot_bank = 0;            //< coz-mcp: time paused beyond what was needed, not yet used
 
   inline void set_in_use(bool value) {
     in_use = value;

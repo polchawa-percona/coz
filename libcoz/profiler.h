@@ -88,6 +88,7 @@ public:
       state->slowdown_epoch = epoch;
       state->slowdown_debt_in = 0;
       state->slowdown_debt_out = 0;
+      state->overshoot_bank = 0;
     }
   }
 
@@ -100,6 +101,14 @@ public:
   /// coz-mcp: perf event that drives sampling ("task-clock", "ref-cycles" or
   /// "cycles"). Call before startup().
   void set_sample_event(const std::string& name);
+
+  /// coz-mcp: what to do with the time a pause sleeps beyond what was needed
+  /// (nanosleep overshoots by tens of microseconds).
+  enum class overshoot_mode {
+    propagate,  //< upstream: the thread is ahead, so every other thread pauses too
+    bank        //< keep it for this thread and pay its next delays from it
+  };
+  void set_overshoot_mode(overshoot_mode m) { _overshoot_mode = m; }
 
   /// coz-mcp: defer virtual delay payments while the thread holds a lock
   void set_lock_aware_delays(bool on) { _lock_aware_delays = on; }
@@ -258,7 +267,12 @@ public:
 
     if(skip_delays) {
       // Skip all delays that were inserted during the blocked period
-      state->local_delay.fetch_add(_global_delay.load() - state->pre_block_time);
+      size_t skipped = _global_delay.load() - state->pre_block_time;
+      state->local_delay.fetch_add(skipped);
+      if(skipped > 0) {
+        _dc.skips.fetch_add(1, std::memory_order_relaxed);
+        _dc.skipped_ns.fetch_add(skipped, std::memory_order_relaxed);
+      }
     }
 
     // Must clear is_blocked before process_samples() because add_delays()
@@ -363,6 +377,22 @@ private:
   uint64_t _sample_event_config = 1;       //< PERF_COUNT_SW_TASK_CLOCK
   uint64_t _sample_event_period = SamplePeriod;
   std::string _sample_event_name = "task-clock";
+  overshoot_mode _overshoot_mode = overshoot_mode::propagate;
+
+  /// coz-mcp: how virtual delays were inserted, paid and skipped (cumulative;
+  /// "stop" reports the change during the experiment).
+  struct delay_counters {
+    std::atomic<size_t> sample_credit_ns{0};  //< credited for selected-line samples
+    std::atomic<size_t> pushed_ns{0};         //< added to the global delay by threads ahead
+    std::atomic<size_t> pauses{0};            //< number of pauses
+    std::atomic<size_t> paused_ns{0};         //< time actually paused
+    std::atomic<size_t> overshoot_ns{0};      //< paused beyond what was needed
+    std::atomic<size_t> banked_used_ns{0};    //< delays paid from earlier overshoot
+    std::atomic<size_t> deferred{0};          //< payments deferred while holding a lock
+    std::atomic<size_t> paused_in_lock{0};    //< pauses while holding a lock
+    std::atomic<size_t> skips{0};             //< wake-ups that skipped delays
+    std::atomic<size_t> skipped_ns{0};        //< delay skipped by woken threads
+  } _dc;
 };
 
 #endif

@@ -436,6 +436,14 @@ void init_coz(void) {
   }
   profiler::get_instance().set_sample_event(
       getenv_safe("COZ_SAMPLE_EVENT", control_socket.empty() ? "task-clock" : "ref-cycles"));
+  // coz-mcp: "bank" keeps pause overshoot per thread instead of making every
+  // other thread pause for it (upstream "propagate", the default). Opt-in:
+  // on the demo it removes the delay inflation but predicts speedups 5-10
+  // points below the real change measured under libcoz.
+  profiler::get_instance().set_overshoot_mode(
+      getenv_safe("COZ_PAUSE_OVERSHOOT", "propagate") == "bank"
+          ? profiler::overshoot_mode::bank
+          : profiler::overshoot_mode::propagate);
   profiler::get_instance().set_lock_aware_delays(
       getenv_safe("COZ_LOCK_AWARE_DELAYS", control_socket.empty() ? "0" : "1") == "1");
 
