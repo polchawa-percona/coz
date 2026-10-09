@@ -23,6 +23,7 @@
 #include "inspect.h"
 #include <sys/mman.h>
 
+#include "latch_stats.h"
 #include "profiler.h"
 #include "progress_point.h"
 #include "real.h"
@@ -72,6 +73,49 @@ extern "C" void _coz_pre_block() {
  */
 extern "C" void _coz_post_block(int skip_delays) {
   if(initialized) profiler::get_instance().post_block(skip_delays != 0);
+}
+
+/*
+ * coz-mcp latch hooks (COZ_LATCH_* in coz.h). Each hook first lets the thread
+ * catch up on Coz delays, so slowdown sleeps for samples taken inside a
+ * critical section are paid before the latch is released. catch_up() looks up
+ * the thread state with a gettid() syscall, so it only runs during
+ * experiments.
+ */
+static inline uint64_t get_monotonic_time() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static inline void latch_catch_up() {
+  if(initialized && profiler::get_instance().experiment_active()) {
+    profiler::get_instance().catch_up();
+  }
+}
+
+static void latch_wait_begin(const void* latch, const char* file, int line,
+                             const char* name, int mode) {
+  latch_catch_up();
+  coz_latch::registry& r = coz_latch::registry::instance();
+  if(r.enabled()) r.wait_begin(latch, file, line, name, mode, get_monotonic_time());
+}
+
+static void latch_acquired(const void* latch) {
+  coz_latch::registry& r = coz_latch::registry::instance();
+  if(r.enabled()) r.acquired(latch, get_monotonic_time());
+}
+
+static void latch_release(const void* latch) {
+  // Catch up first: a slowdown paid here is time the latch is really held.
+  latch_catch_up();
+  coz_latch::registry& r = coz_latch::registry::instance();
+  if(r.enabled()) r.release(latch, get_monotonic_time());
+}
+
+extern "C" coz_latch_api_t* _coz_get_latch_api() {
+  static coz_latch_api_t api = {latch_wait_begin, latch_acquired, latch_release};
+  return &api;
 }
 
 #ifdef __APPLE__

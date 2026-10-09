@@ -65,6 +65,9 @@ struct thread_start_arg {
 void init_coz(void);
 class profiler {
 public:
+  /// coz-mcp: is an experiment running? (cheap check for latch hooks)
+  bool experiment_active() const { return _experiment_active.load(std::memory_order_relaxed); }
+
   /// coz-mcp: enable runtime control over this unix socket (manual mode).
   /// Must be called before startup().
   void set_control_socket(const std::string& path) { _control_socket = path; }

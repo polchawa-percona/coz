@@ -50,3 +50,14 @@ target_compile_features(control_test PRIVATE cxx_std_11)
 
 add_test(NAME control
   COMMAND control_test)
+
+add_executable(latch_stats_test
+  ${PROJECT_SOURCE_DIR}/tests/latch/latch_stats_test.cpp
+  ${PROJECT_SOURCE_DIR}/libcoz/latch_stats.cpp)
+target_include_directories(latch_stats_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/libcoz)
+target_link_libraries(latch_stats_test PRIVATE Threads::Threads)
+target_compile_features(latch_stats_test PRIVATE cxx_std_11)
+
+add_test(NAME latch_stats
+  COMMAND latch_stats_test)

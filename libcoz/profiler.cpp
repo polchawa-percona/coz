@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "inspect.h"
+#include "latch_stats.h"
 #include "perf.h"
 #include "progress_point.h"
 #include "util.h"
@@ -1053,12 +1054,21 @@ public:
     return coz_control::reply::failure("no experiment to stop");
   }
 
-  coz_control::reply latch_stats(bool) override {
-    return coz_control::reply::failure("latch stats not available yet");
+  coz_control::reply latch_stats(bool enable) override {
+    coz_latch::registry::instance().set_enabled(enable);
+    return coz_control::reply::success(string("{\"enabled\":") + (enable ? "true" : "false") + "}");
   }
-  coz_control::reply latch_stats_reset() override { return latch_stats(false); }
+
+  coz_control::reply latch_stats_reset() override {
+    coz_latch::registry::instance().reset();
+    return coz_control::reply::success("{\"reset\":true}");
+  }
+
   coz_control::reply latch_stats_snapshot() override {
-    return latch_stats(false);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    return coz_control::reply::success(coz_latch::registry::instance().snapshot_json(now));
   }
 
   /// Auto-stop an experiment that outlived its max duration (e.g. the client

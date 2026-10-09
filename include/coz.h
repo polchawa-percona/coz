@@ -181,6 +181,69 @@ static void _call_coz_post_block(int skip_delays) {
 #define COZ_CATCH_UP _call_coz_add_delays()
 #define COZ_POST_BLOCK(skip_delays) _call_coz_post_block(skip_delays)
 
+// coz-mcp latch hooks for custom mutexes and rw-latches (e.g. InnoDB).
+//
+//   COZ_LATCH_WAIT_BEGIN(&latch, __FILE__, __LINE__, "latch name", COZ_LATCH_X);
+//   ... acquire (spin / block) ...
+//   COZ_LATCH_ACQUIRED(&latch);
+//   ... critical section ...
+//   COZ_LATCH_RELEASE(&latch);   // before the latch is released
+//
+// Each hook first lets this thread catch up on Coz delays, so that a slowdown
+// of a line inside the critical section is paid while the latch is still held.
+// When latch statistics are enabled (control socket), libcoz also records wait
+// and hold time per acquire site (file:line, name, mode). file and name must
+// point to strings that outlive the program (literals). Without libcoz loaded
+// the hooks do nothing beyond one predictable branch.
+#define COZ_LATCH_MUTEX 0
+#define COZ_LATCH_S 1
+#define COZ_LATCH_X 2
+#define COZ_LATCH_SX 3
+
+typedef struct {
+  void (*wait_begin)(const void* latch, const char* file, int line,
+                     const char* name, int mode);
+  void (*acquired)(const void* latch);
+  void (*release)(const void* latch);
+} coz_latch_api_t;
+
+typedef coz_latch_api_t* (*coz_get_latch_api_t)(void);
+
+// Locate libcoz's latch API table once (null when libcoz is not loaded)
+static coz_latch_api_t* _call_coz_latch_api(void) {
+  static unsigned char _initialized = 0;
+  static coz_latch_api_t* api = 0;
+
+  if(!_initialized) {
+    if(dlsym) {
+      coz_get_latch_api_t fn = 0;
+      void* p = dlsym(RTLD_DEFAULT, "_coz_get_latch_api");
+      memcpy(&fn, &p, sizeof(p));
+      if(fn) api = fn();
+    }
+    _initialized = 1;
+  }
+  return api;
+}
+
+#define COZ_LATCH_WAIT_BEGIN(latch, file, line, name, mode)           \
+  do {                                                                \
+    coz_latch_api_t* _coz_api = _call_coz_latch_api();                \
+    if(_coz_api) _coz_api->wait_begin(latch, file, line, name, mode); \
+  } while(0)
+
+#define COZ_LATCH_ACQUIRED(latch)                      \
+  do {                                                 \
+    coz_latch_api_t* _coz_api = _call_coz_latch_api(); \
+    if(_coz_api) _coz_api->acquired(latch);            \
+  } while(0)
+
+#define COZ_LATCH_RELEASE(latch)                       \
+  do {                                                 \
+    coz_latch_api_t* _coz_api = _call_coz_latch_api(); \
+    if(_coz_api) _coz_api->release(latch);             \
+  } while(0)
+
 #if defined(__cplusplus)
 }
 #endif
