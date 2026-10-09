@@ -94,6 +94,11 @@ struct thread_data {
   std::vector<site*> sites;  // never freed
   std::atomic<uint64_t> unmatched{0};
   std::atomic<uint64_t> overflows{0};
+  std::atomic<uint64_t> handoff_acquires{0};
+  std::atomic<uint64_t> handoff_releases{0};
+  // The owner thread's lock depth; cleared under sites_mutex when the thread
+  // exits, because the variable lives in its TLS.
+  const int* lock_depth = nullptr;
 
   site* lookup(const char* file, int line, const char* name, int mode) {
     site_key k{file, line, name, mode};
@@ -122,6 +127,20 @@ void counters::reset() {
   }
 }
 
+namespace {
+
+/// Clears thread_data::lock_depth when the thread exits.
+struct thread_exit_guard {
+  thread_data* td = nullptr;
+  ~thread_exit_guard() {
+    if(td == nullptr) return;
+    std::lock_guard<std::mutex> g(td->sites_mutex);
+    td->lock_depth = nullptr;
+  }
+};
+
+}  // namespace
+
 registry& registry::instance() {
   // Never destroyed: hooks may run during static destruction.
   static registry* r = new registry();
@@ -135,13 +154,17 @@ thread_data* registry::local() {
   if(td == nullptr || gen != g) {
     td = new thread_data();
     gen = g;
+    thread_local thread_exit_guard guard;
+    guard.td = td;
+    lock_depth_source src = _lock_depth_source.load(std::memory_order_relaxed);
+    if(src != nullptr) td->lock_depth = src();
     std::lock_guard<std::mutex> lock(_threads_mutex);
     _threads.push_back(td);
   }
   uint64_t epoch = _enable_epoch.load(std::memory_order_relaxed);
   if(td->enable_epoch != epoch) {
-    td->enable_epoch = epoch;
-    td->depth = 0;
+    __atomic_store_n(&td->enable_epoch, epoch, __ATOMIC_RELAXED);
+    __atomic_store_n(&td->depth, 0, __ATOMIC_RELAXED);
     td->npending = 0;
   }
   return td;
@@ -159,12 +182,12 @@ void registry::wait_begin(const void* latch, const char* file, int line,
   td->pending[td->npending++] = {latch, td->lookup(file, line, name, mode), now_ns};
 }
 
-void registry::acquired(const void* latch, uint64_t now_ns) {
-  if(!enabled()) return;
-  thread_data* td = local();
+/// Ends the pending wait for latch and records it. @return its site, or null
+/// when there was no wait_begin for the latch.
+static site* end_wait(thread_data* td, const void* latch, uint64_t now_ns) {
   int i = td->npending - 1;
   while(i >= 0 && td->pending[i].latch != latch) i--;
-  if(i < 0) return;
+  if(i < 0) return nullptr;
   site* s = td->pending[i].s;
   uint64_t since = td->pending[i].since;
   td->npending = i;
@@ -174,12 +197,33 @@ void registry::acquired(const void* latch, uint64_t now_ns) {
   add(s->c.wait_ns, wait);
   max_of(s->c.wait_max_ns, wait);
   add(s->c.wait_hist[bucket_of(wait)], 1);
+  return s;
+}
+
+void registry::acquired(const void* latch, uint64_t now_ns) {
+  if(!enabled()) return;
+  thread_data* td = local();
+  site* s = end_wait(td, latch, now_ns);
+  if(s == nullptr) return;
 
   if(td->depth == max_held) {
     add(td->overflows, 1);
     return;
   }
-  td->held[td->depth++] = {latch, s, now_ns};
+  // Snapshots read depth (held_now) from other threads.
+  __atomic_store_n(&td->depth, td->depth + 1, __ATOMIC_RELAXED);
+  td->held[td->depth - 1] = {latch, s, now_ns};
+}
+
+void registry::acquired_handoff(const void* latch, uint64_t now_ns) {
+  if(!enabled()) return;
+  thread_data* td = local();
+  if(end_wait(td, latch, now_ns) != nullptr) add(td->handoff_acquires, 1);
+}
+
+void registry::release_handoff(const void*, uint64_t) {
+  if(!enabled()) return;
+  add(local()->handoff_releases, 1);
 }
 
 void registry::release(const void* latch, uint64_t now_ns) {
@@ -189,7 +233,7 @@ void registry::release(const void* latch, uint64_t now_ns) {
     if(td->held[i].latch != latch) continue;
     held_latch h = td->held[i];
     for(int j = i; j + 1 < td->depth; j++) td->held[j] = td->held[j + 1];
-    td->depth--;
+    __atomic_store_n(&td->depth, td->depth - 1, __ATOMIC_RELAXED);
     uint64_t hold = now_ns >= h.since ? now_ns - h.since : 0;
     add(h.s->c.hold_count, 1);
     add(h.s->c.hold_ns, hold);
@@ -219,13 +263,25 @@ std::string registry::snapshot_json(uint64_t now_ns) {
   // Sites with the same file:line/name/mode from different threads (or with
   // different string pointers) are merged by their text.
   std::map<std::tuple<std::string, int, std::string, int>, merged> all;
-  uint64_t unmatched = 0, overflows = 0;
+  uint64_t unmatched = 0, overflows = 0, handoff_acquires = 0, handoff_releases = 0;
+  uint64_t held_now = 0, depth_threads = 0, depth_raised = 0, depth_max = 0;
   {
     std::lock_guard<std::mutex> lock(_threads_mutex);
+    uint64_t epoch = _enable_epoch.load(std::memory_order_relaxed);
     for(thread_data* td : _threads) {
       unmatched += td->unmatched.load(std::memory_order_relaxed);
       overflows += td->overflows.load(std::memory_order_relaxed);
+      handoff_acquires += td->handoff_acquires.load(std::memory_order_relaxed);
+      handoff_releases += td->handoff_releases.load(std::memory_order_relaxed);
+      // A stack from before stats were last turned on is dropped on next use.
+      if(__atomic_load_n(&td->enable_epoch, __ATOMIC_RELAXED) == epoch) held_now += __atomic_load_n(&td->depth, __ATOMIC_RELAXED);
       std::lock_guard<std::mutex> g(td->sites_mutex);
+      if(td->lock_depth != nullptr) {
+        int d = __atomic_load_n(td->lock_depth, __ATOMIC_RELAXED);
+        depth_threads++;
+        if(d > 0) depth_raised++;
+        if(d > 0 && (uint64_t)d > depth_max) depth_max = (uint64_t)d;
+      }
       for(site* s : td->sites) {
         merged& m = all[std::make_tuple(std::string(s->file), s->line,
                                         std::string(s->name), s->mode)];
@@ -251,6 +307,12 @@ std::string registry::snapshot_json(uint64_t now_ns) {
   r += ",\"now_ns\":" + std::to_string(now_ns);
   r += ",\"unmatched_releases\":" + std::to_string(unmatched);
   r += ",\"stack_overflows\":" + std::to_string(overflows);
+  r += ",\"handoff_acquires\":" + std::to_string(handoff_acquires);
+  r += ",\"handoff_releases\":" + std::to_string(handoff_releases);
+  r += ",\"held_now\":" + std::to_string(held_now);
+  r += ",\"lock_depth_threads\":" + std::to_string(depth_threads);
+  r += ",\"lock_depth_raised\":" + std::to_string(depth_raised);
+  r += ",\"lock_depth_max\":" + std::to_string(depth_max);
   r += ",\"latches\":[";
   bool first = true;
   for(const auto& e : all) {

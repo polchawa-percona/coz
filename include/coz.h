@@ -244,6 +244,64 @@ static coz_latch_api_t* _call_coz_latch_api(void) {
     if(_coz_api) _coz_api->release(latch);             \
   } while(0)
 
+// coz-mcp latch hooks, version 2 (_coz_get_latch_api2): the v1 functions plus
+// hand-off latches and pre/post block, in one table.
+//
+// A hand-off latch is acquired by one thread and released by another, e.g. a
+// buffer latch handed to asynchronous I/O and released by the I/O completion
+// thread. Report its acquisition with COZ_LATCH_ACQUIRED_HANDOFF and its
+// release (on whichever thread) with COZ_LATCH_RELEASE_HANDOFF. Neither
+// changes the lock depth of the calling thread, so the acquiring thread does
+// not count as a lock holder afterwards; the release lets the releasing
+// thread catch up on delays before waiters wake. Waits are reported with
+// COZ_LATCH_WAIT_BEGIN as for any latch. Latch statistics record the wait but
+// no hold time (the time until release is I/O time).
+//
+// Do not mix: a latch acquired with COZ_LATCH_ACQUIRED must be released with
+// COZ_LATCH_RELEASE, and a hand-off latch with COZ_LATCH_RELEASE_HANDOFF.
+typedef struct {
+  void (*wait_begin)(const void* latch, const char* file, int line,
+                     const char* name, int mode);
+  void (*acquired)(const void* latch);
+  void (*release)(const void* latch);
+  void (*acquired_handoff)(const void* latch);
+  void (*release_handoff)(const void* latch);
+  void (*pre_block)(void);
+  void (*post_block)(int skip_delays);
+} coz_latch_api2_t;
+
+typedef coz_latch_api2_t* (*coz_get_latch_api2_t)(void);
+
+// Locate libcoz's v2 latch API table once (null when libcoz is not loaded or
+// is too old to have it)
+static coz_latch_api2_t* _call_coz_latch_api2(void) {
+  static unsigned char _initialized = 0;
+  static coz_latch_api2_t* api = 0;
+
+  if(!_initialized) {
+    if(dlsym) {
+      coz_get_latch_api2_t fn = 0;
+      void* p = dlsym(RTLD_DEFAULT, "_coz_get_latch_api2");
+      memcpy(&fn, &p, sizeof(p));
+      if(fn) api = fn();
+    }
+    _initialized = 1;
+  }
+  return api;
+}
+
+#define COZ_LATCH_ACQUIRED_HANDOFF(latch)                \
+  do {                                                   \
+    coz_latch_api2_t* _coz_api = _call_coz_latch_api2(); \
+    if(_coz_api) _coz_api->acquired_handoff(latch);      \
+  } while(0)
+
+#define COZ_LATCH_RELEASE_HANDOFF(latch)                 \
+  do {                                                   \
+    coz_latch_api2_t* _coz_api = _call_coz_latch_api2(); \
+    if(_coz_api) _coz_api->release_handoff(latch);       \
+  } while(0)
+
 #if defined(__cplusplus)
 }
 #endif

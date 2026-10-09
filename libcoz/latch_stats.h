@@ -6,6 +6,14 @@
  * hot path never touches a shared cache line; snapshots sum all threads.
  * Times are passed in by the caller (nanoseconds, monotonic) so the logic can
  * be tested without a clock.
+ *
+ * Hand-off latches (acquired_handoff / release_handoff) are latches whose
+ * ownership passes to another agent after acquisition, e.g. InnoDB block
+ * latches taken with a pass value for asynchronous I/O and released by an I/O
+ * handler thread. Their wait is recorded at the acquire site as usual, but they
+ * are not put on the acquiring thread's held stack and have no hold time: the
+ * time until release is I/O time, not time spent in a critical section, and
+ * it would be measured across threads. Only their counts are reported.
  */
 
 #ifndef COZ_LATCH_STATS_H
@@ -69,6 +77,18 @@ public:
                   const char* name, int mode, uint64_t now_ns);
   void acquired(const void* latch, uint64_t now_ns);
   void release(const void* latch, uint64_t now_ns);
+  /// Acquisition of a hand-off latch: ends the wait, is not held by the thread.
+  void acquired_handoff(const void* latch, uint64_t now_ns);
+  /// Release of a hand-off latch, by any thread.
+  void release_handoff(const void* latch, uint64_t now_ns);
+
+  /// Function returning the address of the calling thread's lock depth
+  /// (libcoz's coz_lock_depth). Threads known to the registry report their
+  /// current depth in snapshots, so a depth that stays raised is visible.
+  using lock_depth_source = const int* (*)();
+  void set_lock_depth_source(lock_depth_source fn) {
+    _lock_depth_source.store(fn, std::memory_order_relaxed);
+  }
 
   /// Zero all counters (races with concurrent updates are tolerated).
   void reset();
@@ -87,6 +107,7 @@ private:
   std::vector<thread_data*> _threads;    // never freed: stats outlive threads
   std::atomic<uint64_t> _generation{0};  // bumped by clear_for_test
   std::atomic<uint64_t> _enable_epoch{0};  // bumped when stats are turned on
+  std::atomic<lock_depth_source> _lock_depth_source{nullptr};
 };
 
 }  // namespace coz_latch

@@ -4,6 +4,7 @@
 
 #include "latch_stats.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -213,6 +214,123 @@ TEST(nested_wait_keeps_outer_wait) {
   std::string snap = r.snapshot_json(5000);
   ASSERT_TRUE(field(site_json(snap, "/src/a.cc:80", "x"), "wait_ns") == 1000);
   ASSERT_TRUE(field(site_json(snap, "/src/b.cc:81", "mutex"), "wait_ns") == 50);
+}
+
+TEST(handoff_release_on_other_thread) {
+  // InnoDB page read: the reading thread X-latches the block with a pass value
+  // and an I/O handler thread releases it when the read completes.
+  registry& r = registry::instance();
+  static int latch;
+  std::thread reader([&] {
+    r.wait_begin(&latch, FILE_A, 90, NAME_L, 2, 0);
+    r.acquired_handoff(&latch, 100);
+  });
+  reader.join();
+  std::thread io([&] { r.release_handoff(&latch, 5000); });
+  io.join();
+  std::string snap = r.snapshot_json(10000);
+  std::string o = site_json(snap, "/src/a.cc:90", "x");
+  ASSERT_TRUE(field(o, "count") == 1);
+  ASSERT_TRUE(field(o, "wait_ns") == 100);
+  ASSERT_TRUE(field(o, "hold_count") == 0);  // I/O time is not a hold
+  ASSERT_TRUE(field(snap, "unmatched_releases") == 0);
+  ASSERT_TRUE(field(snap, "stack_overflows") == 0);
+  ASSERT_TRUE(field(snap, "handoff_acquires") == 1);
+  ASSERT_TRUE(field(snap, "handoff_releases") == 1);
+  ASSERT_TRUE(field(snap, "held_now") == 0);
+}
+
+TEST(handoff_does_not_fill_held_stack) {
+  // A page cleaner flushes many pages: each SX latch taken with a pass value
+  // is released by an I/O thread and must not stay on the cleaner's stack.
+  registry& r = registry::instance();
+  static int pages[max_held + 10];
+  int mine;
+  r.wait_begin(&mine, FILE_B, 91, NAME_M, 0, 0);
+  r.acquired(&mine, 0);
+  for(int i = 0; i < max_held + 10; i++) {
+    r.wait_begin(&pages[i], FILE_A, 92, NAME_L, 3, i);
+    r.acquired_handoff(&pages[i], i);
+  }
+  std::thread io([&] {
+    for(int i = 0; i < max_held + 10; i++) r.release_handoff(&pages[i], 1000);
+  });
+  io.join();
+  r.release(&mine, 2000);
+  std::string snap = r.snapshot_json(3000);
+  ASSERT_TRUE(field(snap, "stack_overflows") == 0);
+  ASSERT_TRUE(field(snap, "unmatched_releases") == 0);
+  ASSERT_TRUE(field(snap, "held_now") == 0);
+  ASSERT_TRUE(field(site_json(snap, "/src/b.cc:91", "mutex"), "hold_ns") == 2000);
+  ASSERT_TRUE(field(site_json(snap, "/src/a.cc:92", "sx"), "count") == max_held + 10);
+}
+
+TEST(handoff_same_thread_balanced) {
+  // Synchronous page read: the same thread acquires and releases.
+  registry& r = registry::instance();
+  int outer, page;
+  r.wait_begin(&outer, FILE_B, 93, NAME_M, 0, 0);
+  r.acquired(&outer, 0);
+  r.wait_begin(&page, FILE_A, 94, NAME_L, 2, 10);
+  r.acquired_handoff(&page, 20);
+  r.release_handoff(&page, 500);
+  r.release(&outer, 700);
+  std::string snap = r.snapshot_json(1000);
+  ASSERT_TRUE(field(snap, "unmatched_releases") == 0);
+  ASSERT_TRUE(field(snap, "held_now") == 0);
+  ASSERT_TRUE(field(site_json(snap, "/src/b.cc:93", "mutex"), "hold_ns") == 700);
+  ASSERT_TRUE(field(site_json(snap, "/src/a.cc:94", "x"), "wait_ns") == 10);
+}
+
+TEST(normal_cross_thread_release_is_still_unmatched) {
+  // Without the hand-off API the acquiring thread keeps the latch on its stack.
+  registry& r = registry::instance();
+  static int latch;
+  std::thread reader([&] {
+    r.wait_begin(&latch, FILE_A, 95, NAME_L, 2, 0);
+    r.acquired(&latch, 100);
+  });
+  reader.join();
+  r.release(&latch, 5000);
+  std::string snap = r.snapshot_json(10000);
+  ASSERT_TRUE(field(snap, "unmatched_releases") == 1);
+  ASSERT_TRUE(field(snap, "held_now") == 1);
+}
+
+static thread_local int test_lock_depth = 0;
+static const int* test_lock_depth_source() {
+  return &test_lock_depth;
+}
+
+TEST(lock_depth_of_live_threads) {
+  registry& r = registry::instance();
+  r.set_lock_depth_source(test_lock_depth_source);
+  std::atomic<int> step{0};
+  int latch;
+  std::thread t([&] {
+    test_lock_depth = 3;
+    r.wait_begin(&latch, FILE_A, 96, NAME_M, 0, 0);  // registers the thread
+    step = 1;
+    while(step != 2) std::this_thread::yield();
+    test_lock_depth = 0;
+    step = 3;
+    while(step != 4) std::this_thread::yield();
+  });
+  while(step != 1) std::this_thread::yield();
+  std::string snap = r.snapshot_json(100);
+  ASSERT_TRUE(field(snap, "lock_depth_raised") == 1);
+  ASSERT_TRUE(field(snap, "lock_depth_max") == 3);
+  step = 2;
+  while(step != 3) std::this_thread::yield();
+  snap = r.snapshot_json(200);
+  ASSERT_TRUE(field(snap, "lock_depth_raised") == 0);
+  ASSERT_TRUE(field(snap, "lock_depth_threads") >= 1);
+  step = 4;
+  t.join();
+  // An exited thread is no longer read (its TLS is gone).
+  snap = r.snapshot_json(300);
+  ASSERT_TRUE(field(snap, "lock_depth_threads") == 0);
+  r.set_lock_depth_source(nullptr);
 }
 
 int main() {

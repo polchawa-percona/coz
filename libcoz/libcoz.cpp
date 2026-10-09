@@ -231,8 +231,60 @@ static void latch_release(const void* latch) {
   lock_after_release(false);
 }
 
+/*
+ * Hand-off latches: the latch is acquired by one thread and released by
+ * another, e.g. an InnoDB block latch taken with a pass value for an
+ * asynchronous read or write and released by the I/O handler thread when the
+ * I/O completes. The acquiring thread does not hold the latch afterwards in
+ * any sense that matters to Coz: it does not run a critical section, so its
+ * lock depth is not raised (virtual delays are not deferred, slowdown debt is
+ * paid as outside a lock) and the releasing thread's depth is not lowered.
+ * The wait itself is an ordinary latch wait: the latch may be held by
+ * another thread (pre_block()/post_block(true) as for any latch).
+ */
+static void latch_acquired_handoff(const void* latch) {
+  if(initialized) latch_end_wait(latch);
+  coz_latch::registry& r = coz_latch::registry::instance();
+  if(r.enabled()) r.acquired_handoff(latch, get_monotonic_time());
+}
+
+static void latch_release_handoff(const void* latch) {
+  // The release may wake threads waiting for the latch: publish this thread's
+  // delays first, as before any other release.
+  if(initialized) {
+    profiler& p = profiler::get_instance();
+    if(p.experiment_active()) p.catch_up();
+  }
+  coz_latch::registry& r = coz_latch::registry::instance();
+  if(r.enabled()) r.release_handoff(latch, get_monotonic_time());
+}
+
+static void latch_pre_block() {
+  _coz_pre_block();
+}
+static void latch_post_block(int skip_delays) {
+  _coz_post_block(skip_delays);
+}
+
+/// Lets latch statistics report the lock depth of each thread.
+static const int* current_lock_depth() {
+  return &coz_lock_depth;
+}
+static const bool lock_depth_source_set = [] {
+  coz_latch::registry::instance().set_lock_depth_source(current_lock_depth);
+  return true;
+}();
+
 extern "C" coz_latch_api_t* _coz_get_latch_api() {
   static coz_latch_api_t api = {latch_wait_begin, latch_acquired, latch_release};
+  return &api;
+}
+
+extern "C" coz_latch_api2_t* _coz_get_latch_api2() {
+  static coz_latch_api2_t api = {latch_wait_begin, latch_acquired,
+                                 latch_release, latch_acquired_handoff,
+                                 latch_release_handoff, latch_pre_block,
+                                 latch_post_block};
   return &api;
 }
 
