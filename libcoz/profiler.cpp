@@ -235,7 +235,7 @@ void profiler::profiler_thread(spinlock& l) {
   l.unlock();
   // coz-mcp manual mode: experiments only on request over the control socket.
   // Progress points are not required (throughput is measured externally).
-  if (!_control_socket.empty()) {
+  if(!_control_socket.empty()) {
     control_loop(output);
     log_samples(output, start_time);
     output.flush();
@@ -755,7 +755,7 @@ void profiler::process_samples(thread_state* state) {
 
       if(_experiment_active) {
         // Add a delay if the sample is in the selected line
-        if (sampled_line.second) {
+        if(sampled_line.second) {
           state->local_delay.fetch_add(_delay_size.load());
           selected_hits++;
         }
@@ -770,9 +770,9 @@ void profiler::process_samples(thread_state* state) {
   // coz-mcp slowdown: this thread really runs the selected line slower, so it
   // sleeps itself. The sleep is not virtual delay: it is neither credited to
   // local_delay nor added to _global_delay, so no other thread pauses for it.
-  if (selected_hits > 0) {
+  if(selected_hits > 0) {
     size_t slowdown = _slowdown_size.load();
-    if (slowdown > 0) _slowdown_total.fetch_add(wait(selected_hits * slowdown));
+    if(slowdown > 0) _slowdown_total.fetch_add(wait(selected_hits * slowdown));
   }
 
   add_delays(state);
@@ -958,13 +958,14 @@ void profiler::on_error(int signum, siginfo_t* info, void* p) {
  * _slowdown_size) are shared.
  */
 class control_backend : public coz_control::backend {
- public:
-  control_backend(profiler& p, ofstream& output) : _p(p), _output(output) {}
+public:
+  control_backend(profiler& p, ofstream& output)
+      : _p(p), _output(output) {}
 
   coz_control::reply status() override {
     string r = "{\"mode\":\"manual\",\"experiment_active\":";
     r += _active ? "true" : "false";
-    if (_active) {
+    if(_active) {
       r += ",\"line\":\"" + line_to_json_string(_selected) + "\"";
       r += ",\"kind\":\"" + kind_name() + "\"";
       r += ",\"percent\":" + to_string(_percent);
@@ -980,13 +981,13 @@ class control_backend : public coz_control::backend {
   coz_control::reply hot_lines(size_t min_samples) override {
     vector<pair<size_t, string>> lines;
     size_t total = 0;
-    for (const auto& f : memory_map::get_instance().files()) {
-      for (const auto& entry : f.second->lines()) {
+    for(const auto& f : memory_map::get_instance().files()) {
+      for(const auto& entry : f.second->lines()) {
         const line* l = entry.second.get();
         size_t n = l->get_samples();
-        if (n == 0 || is_coz_header(l)) continue;
+        if(n == 0 || is_coz_header(l)) continue;
         total += n;
-        if (n >= min_samples) lines.emplace_back(n, line_to_json_string(l));
+        if(n >= min_samples) lines.emplace_back(n, line_to_json_string(l));
       }
     }
     sort(lines.begin(), lines.end(),
@@ -994,8 +995,8 @@ class control_backend : public coz_control::backend {
            return a.first > b.first;
          });
     string r = "{\"total_samples\":" + to_string(total) + ",\"lines\":[";
-    for (size_t i = 0; i < lines.size(); i++) {
-      if (i > 0) r += ",";
+    for(size_t i = 0; i < lines.size(); i++) {
+      if(i > 0) r += ",";
       r += "{\"line\":\"" + lines[i].second +
            "\",\"samples\":" + to_string(lines[i].first) + "}";
     }
@@ -1006,10 +1007,10 @@ class control_backend : public coz_control::backend {
   coz_control::reply start(const string& name,
                            coz_control::experiment_kind kind, unsigned percent,
                            double max_duration_s) override {
-    if (_active)
+    if(_active)
       return coz_control::reply::failure("an experiment is already active");
     shared_ptr<line> l = memory_map::get_instance().find_line(name);
-    if (!l) return coz_control::reply::failure("line not found: " + name);
+    if(!l) return coz_control::reply::failure("line not found: " + name);
 
     _selected = l.get();
     _kind = kind;
@@ -1036,7 +1037,7 @@ class control_backend : public coz_control::backend {
     r += ",\"start_ns\":" + to_string(_start_time);
     r += ",\"global_delay_ns\":" + to_string(_start_delay);
     r += ",\"samples\":" + to_string(_start_samples);
-    if (_start_samples == 0)
+    if(_start_samples == 0)
       r += ",\"warning\":\"line has no samples so far; the experiment may have "
            "no effect\"";
     r += "}";
@@ -1044,8 +1045,8 @@ class control_backend : public coz_control::backend {
   }
 
   coz_control::reply stop() override {
-    if (_active) return coz_control::reply::success(finish(false));
-    if (_has_pending) {
+    if(_active) return coz_control::reply::success(finish(false));
+    if(_has_pending) {
       _has_pending = false;
       return coz_control::reply::success(_pending);
     }
@@ -1063,7 +1064,7 @@ class control_backend : public coz_control::backend {
   /// Auto-stop an experiment that outlived its max duration (e.g. the client
   /// died).
   void check_deadline() {
-    if (_active && get_time() >= _deadline) {
+    if(_active && get_time() >= _deadline) {
       _pending = finish(true);
       _has_pending = true;
     }
@@ -1100,7 +1101,7 @@ class control_backend : public coz_control::backend {
     return r;
   }
 
- private:
+private:
   string kind_name() const {
     return _kind == coz_control::experiment_kind::speedup ? "speedup"
                                                           : "slowdown";
@@ -1124,18 +1125,18 @@ class control_backend : public coz_control::backend {
 void profiler::control_loop(ofstream& output) {
   coz_control::server srv;
   string err;
-  if (!srv.open(_control_socket, err)) {
+  if(!srv.open(_control_socket, err)) {
     WARNING << "coz-mcp: cannot open control socket: " << err;
-    while (_running) wait(ExperimentCoolOffTime);
+    while(_running) wait(ExperimentCoolOffTime);
     return;
   }
   VERBOSE << "coz-mcp: control socket " << _control_socket;
 
   control_backend backend(*this, output);
-  while (_running) {
+  while(_running) {
     srv.poll_once(50, backend);
     backend.check_deadline();
   }
-  if (backend.active()) backend.finish(false);
+  if(backend.active()) backend.finish(false);
   srv.close();
 }

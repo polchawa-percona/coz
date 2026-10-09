@@ -20,33 +20,35 @@ using namespace coz_control;
 static int tests_run = 0;
 static int tests_passed = 0;
 
-#define TEST(name)                       \
-  static void test_##name();             \
-  static struct Register_##name {        \
-    Register_##name() { test_##name(); } \
-  } register_##name;                     \
+#define TEST(name)                \
+  static void test_##name();      \
+  static struct Register_##name { \
+    Register_##name() {           \
+      test_##name();              \
+    }                             \
+  } register_##name;              \
   static void test_##name()
 
 #define ASSERT_TRUE(expr)                                              \
   do {                                                                 \
     tests_run++;                                                       \
-    if (!(expr)) {                                                     \
+    if(!(expr)) {                                                      \
       fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
     } else {                                                           \
       tests_passed++;                                                  \
     }                                                                  \
-  } while (0)
+  } while(0)
 
 #define ASSERT_EQ(a, b)                                               \
   do {                                                                \
     tests_run++;                                                      \
-    if (!((a) == (b))) {                                              \
+    if(!((a) == (b))) {                                               \
       fprintf(stderr, "FAIL: %s:%d: %s == %s\n  got: %s\n", __FILE__, \
               __LINE__, #a, #b, std::string(a).c_str());              \
     } else {                                                          \
       tests_passed++;                                                 \
     }                                                                 \
-  } while (0)
+  } while(0)
 
 /// Records calls and returns canned replies.
 struct fake_backend : backend {
@@ -74,7 +76,7 @@ struct fake_backend : backend {
     kind = k;
     percent = p;
     max_duration = d;
-    if (l == "missing.cc:1") return reply::failure("line not found");
+    if(l == "missing.cc:1") return reply::failure("line not found");
     return reply::success("{\"start_ns\":1}");
   }
   reply stop() override {
@@ -207,7 +209,7 @@ static int connect_to(const std::string& path) {
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-  if (connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
+  if(connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) {
     ::close(fd);
     return -1;
   }
@@ -217,7 +219,7 @@ static int connect_to(const std::string& path) {
 static std::string read_line(int fd) {
   std::string s;
   char c;
-  while (read(fd, &c, 1) == 1 && c != '\n') s += c;
+  while(read(fd, &c, 1) == 1 && c != '\n') s += c;
   return s;
 }
 
@@ -240,7 +242,7 @@ TEST(server_round_trip) {
   std::string req = "{\"cmd\":\"status\"}\n{\"cmd\":\"st";
   ASSERT_TRUE(write(fd, req.data(), req.size()) == (ssize_t)req.size());
   std::thread t([&] {
-    for (int i = 0; i < 20; i++) srv.poll_once(10, b);
+    for(int i = 0; i < 20; i++) srv.poll_once(10, b);
   });
   usleep(30000);
   std::string rest = "op\"}\ngarbage\n";
@@ -257,7 +259,7 @@ TEST(server_round_trip) {
   ASSERT_TRUE(fd >= 0);
   std::string r2 = "{\"cmd\":\"status\"}\n";
   ASSERT_TRUE(write(fd, r2.data(), r2.size()) == (ssize_t)r2.size());
-  for (int i = 0; i < 5; i++) srv.poll_once(10, b);
+  for(int i = 0; i < 5; i++) srv.poll_once(10, b);
   ASSERT_EQ(read_line(fd), std::string("{\"mode\":\"manual\"}"));
   ::close(fd);
 

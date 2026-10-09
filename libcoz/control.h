@@ -21,7 +21,10 @@ namespace coz_control {
 
 /// A scalar JSON value (requests are flat objects).
 struct value {
-  enum kind_t { null_v, bool_v, number_v, string_v } kind = null_v;
+  enum kind_t { null_v,
+                bool_v,
+                number_v,
+                string_v } kind = null_v;
   bool b = false;
   double num = 0;
   std::string str;
@@ -43,11 +46,12 @@ struct reply {
   static reply failure(std::string msg) { return {false, std::move(msg)}; }
 };
 
-enum class experiment_kind { speedup, slowdown };
+enum class experiment_kind { speedup,
+                             slowdown };
 
 /// Operations the control protocol can invoke. Implemented by the profiler.
 class backend {
- public:
+public:
   virtual ~backend() = default;
   virtual reply status() = 0;
   virtual reply hot_lines(size_t min_samples) = 0;
@@ -67,7 +71,7 @@ std::string dispatch(const std::string& request, backend& b);
 
 /// Unix socket server; single client at a time, line-oriented.
 class server {
- public:
+public:
   server() = default;
   ~server();
   server(const server&) = delete;
@@ -79,7 +83,7 @@ class server {
   void poll_once(int timeout_ms, backend& b);
   void close();
 
- private:
+private:
   void accept_client();
   void drop_client();
   bool read_client(backend& b);

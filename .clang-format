@@ -1,0 +1,12 @@
+# Approximates the existing Coz style so that formatting new code does not
+# rewrite upstream code (no rewrapping, no include sorting).
+BasedOnStyle: Google
+ColumnLimit: 0
+SpaceBeforeParens: Never
+AccessModifierOffset: -2
+SortIncludes: Never
+IncludeBlocks: Preserve
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+DerivePointerAlignment: false
+PointerAlignment: Left
