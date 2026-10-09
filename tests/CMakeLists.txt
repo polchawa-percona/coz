@@ -39,3 +39,14 @@ add_test(NAME rust_source_filter
           ${RUST_FILTER_OUTPUT_DIR})
 set_tests_properties(rust_source_filter PROPERTIES
   ENVIRONMENT "PYTHONUNBUFFERED=1")
+
+add_executable(control_test
+  ${PROJECT_SOURCE_DIR}/tests/control/control_test.cpp
+  ${PROJECT_SOURCE_DIR}/libcoz/control.cpp)
+target_include_directories(control_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/libcoz)
+target_link_libraries(control_test PRIVATE Threads::Threads)
+target_compile_features(control_test PRIVATE cxx_std_11)
+
+add_test(NAME control
+  COMMAND control_test)

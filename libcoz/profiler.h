@@ -15,15 +15,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ccutil/spinlock.h"
+#include "ccutil/static_map.h"
+#include "control.h"
 #include "coz.h"
-
 #include "inspect.h"
 #include "progress_point.h"
 #include "thread_state.h"
 #include "util.h"
-
-#include "ccutil/spinlock.h"
-#include "ccutil/static_map.h"
 
 /// Type of a thread entry function
 typedef void* (*thread_fn_t)(void*);
@@ -63,34 +62,37 @@ struct thread_start_arg {
 void init_coz(void);
 class profiler {
 public:
-  /// Start the profiler
-  void startup(const std::string& outfile,
-               line* fixed_line,
-               int fixed_speedup,
-               bool end_to_end);
+ /// Start the profiler
+ /// coz-mcp: enable runtime control over this unix socket (manual mode).
+ /// Must be called before startup().
+ void set_control_socket(const std::string& path) { _control_socket = path; }
 
-  /// Shut down the profiler
-  void shutdown();
+ void startup(const std::string& outfile, line* fixed_line, int fixed_speedup,
+              bool end_to_end);
 
-  /// Get or create a progress point to measure throughput
-  throughput_point* get_throughput_point(const std::string& name) {
-    // Lock the map of throughput points
-    _throughput_points_lock.lock();
-  
-    // Search for a matching point
-    auto search = _throughput_points.find(name);
-  
-    // If there is no match, add a new throughput point
-    if(search == _throughput_points.end()) {
-      search = _throughput_points.emplace_hint(search, name, new throughput_point(name));
-    }
-  
-    // Get the matching or inserted value
-    throughput_point* result = search->second;
-  
-    // Unlock the map and return the result
-    _throughput_points_lock.unlock();
-    return result;
+ /// Shut down the profiler
+ void shutdown();
+
+ /// Get or create a progress point to measure throughput
+ throughput_point* get_throughput_point(const std::string& name) {
+   // Lock the map of throughput points
+   _throughput_points_lock.lock();
+
+   // Search for a matching point
+   auto search = _throughput_points.find(name);
+
+   // If there is no match, add a new throughput point
+   if (search == _throughput_points.end()) {
+     search = _throughput_points.emplace_hint(search, name,
+                                              new throughput_point(name));
+   }
+
+   // Get the matching or inserted value
+   throughput_point* result = search->second;
+
+   // Unlock the map and return the result
+   _throughput_points_lock.unlock();
+   return result;
   }
   
   /// Get or create a progress point to measure latency
@@ -255,6 +257,9 @@ private:
   void apply_pending_delays();                //< Apply pending delays using Mach thread suspension (macOS)
   std::pair<line*,bool> match_line(perf_event::record&);       //< Map a sample to its source line and matches with selected_line
   void log_samples(std::ofstream&, size_t);   //< Log runtime and sample counts for all identified regions
+  void control_loop(
+      std::ofstream& output);  //< coz-mcp: serve the control socket instead of
+                               //running experiments
 
   thread_state* add_thread(); //< Add a thread state entry for this thread
   thread_state* get_thread_state(); //< Get a reference to the thread state object for this thread
@@ -294,6 +299,15 @@ private:
 
   /// Atomic flag to guarantee shutdown procedures run exactly one time
   std::atomic_flag _shutdown_run = ATOMIC_FLAG_INIT;
+
+  // coz-mcp runtime control (manual mode).
+  friend class control_backend;
+  std::string
+      _control_socket;  //< Control socket path; empty = upstream behaviour
+  std::atomic<size_t> _slowdown_size{
+      0};  //< Sleep per selected-line sample in a slowdown experiment
+  std::atomic<size_t> _slowdown_total{
+      0};  //< Total time slept for slowdown experiments
 };
 
 #endif

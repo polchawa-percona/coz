@@ -233,6 +233,16 @@ void profiler::profiler_thread(spinlock& l) {
   // Unblock the main thread
   VERBOSE << "Profiler thread unlocking spinlock...";
   l.unlock();
+  // coz-mcp manual mode: experiments only on request over the control socket.
+  // Progress points are not required (throughput is measured externally).
+  if (!_control_socket.empty()) {
+    control_loop(output);
+    log_samples(output, start_time);
+    output.flush();
+    output.close();
+    return;
+  }
+
   VERBOSE << "Profiler thread waiting for progress points...";
 
   // Wait until there is at least one progress point
@@ -734,6 +744,7 @@ void profiler::add_delays(thread_state* state) {
 }
 
 void profiler::process_samples(thread_state* state) {
+  size_t selected_hits = 0;
   for(perf_event::record r : state->sampler) {
     if(r.is_sample()) {
       // Find and match the line that contains this sample
@@ -744,14 +755,24 @@ void profiler::process_samples(thread_state* state) {
 
       if(_experiment_active) {
         // Add a delay if the sample is in the selected line
-        if(sampled_line.second)
+        if (sampled_line.second) {
           state->local_delay.fetch_add(_delay_size.load());
+          selected_hits++;
+        }
 
       } else if(sampled_line.first != nullptr && _next_line.load() == nullptr
                 && !is_coz_header(sampled_line.first)) {
         _next_line.store(sampled_line.first);
       }
     }
+  }
+
+  // coz-mcp slowdown: this thread really runs the selected line slower, so it
+  // sleeps itself. The sleep is not virtual delay: it is neither credited to
+  // local_delay nor added to _global_delay, so no other thread pauses for it.
+  if (selected_hits > 0) {
+    size_t slowdown = _slowdown_size.load();
+    if (slowdown > 0) _slowdown_total.fetch_add(wait(selected_hits * slowdown));
   }
 
   add_delays(state);
@@ -928,4 +949,193 @@ void profiler::on_error(int signum, siginfo_t* info, void* p) {
   }
 
   _exit(2);
+}
+
+/*
+ * coz-mcp runtime control. Everything below runs on the profiler thread, so the
+ * manual experiment state needs no locking; only the atomics that sampled
+ * threads read (_experiment_active, _selected_line, _delay_size,
+ * _slowdown_size) are shared.
+ */
+class control_backend : public coz_control::backend {
+ public:
+  control_backend(profiler& p, ofstream& output) : _p(p), _output(output) {}
+
+  coz_control::reply status() override {
+    string r = "{\"mode\":\"manual\",\"experiment_active\":";
+    r += _active ? "true" : "false";
+    if (_active) {
+      r += ",\"line\":\"" + line_to_json_string(_selected) + "\"";
+      r += ",\"kind\":\"" + kind_name() + "\"";
+      r += ",\"percent\":" + to_string(_percent);
+    }
+    r += ",\"global_delay_ns\":" + to_string(_p._global_delay.load());
+    r += ",\"slowdown_ns\":" + to_string(_p._slowdown_total.load());
+    r += ",\"threads\":" + to_string(_p._num_threads_running.load());
+    r += ",\"now_ns\":" + to_string(get_time());
+    r += "}";
+    return coz_control::reply::success(r);
+  }
+
+  coz_control::reply hot_lines(size_t min_samples) override {
+    vector<pair<size_t, string>> lines;
+    size_t total = 0;
+    for (const auto& f : memory_map::get_instance().files()) {
+      for (const auto& entry : f.second->lines()) {
+        const line* l = entry.second.get();
+        size_t n = l->get_samples();
+        if (n == 0 || is_coz_header(l)) continue;
+        total += n;
+        if (n >= min_samples) lines.emplace_back(n, line_to_json_string(l));
+      }
+    }
+    sort(lines.begin(), lines.end(),
+         [](const pair<size_t, string>& a, const pair<size_t, string>& b) {
+           return a.first > b.first;
+         });
+    string r = "{\"total_samples\":" + to_string(total) + ",\"lines\":[";
+    for (size_t i = 0; i < lines.size(); i++) {
+      if (i > 0) r += ",";
+      r += "{\"line\":\"" + lines[i].second +
+           "\",\"samples\":" + to_string(lines[i].first) + "}";
+    }
+    r += "]}";
+    return coz_control::reply::success(r);
+  }
+
+  coz_control::reply start(const string& name,
+                           coz_control::experiment_kind kind, unsigned percent,
+                           double max_duration_s) override {
+    if (_active)
+      return coz_control::reply::failure("an experiment is already active");
+    shared_ptr<line> l = memory_map::get_instance().find_line(name);
+    if (!l) return coz_control::reply::failure("line not found: " + name);
+
+    _selected = l.get();
+    _kind = kind;
+    _percent = percent;
+    _has_pending = false;
+    size_t size = (size_t)SamplePeriod * percent / 100;
+
+    // Publish the experiment parameters before activating it.
+    _p._selected_line.store(_selected);
+    _p._delay_size.store(kind == coz_control::experiment_kind::speedup ? size
+                                                                       : 0);
+    _p._slowdown_size.store(
+        kind == coz_control::experiment_kind::slowdown ? size : 0);
+
+    _start_time = get_time();
+    _start_delay = _p._global_delay.load();
+    _start_slowdown = _p._slowdown_total.load();
+    _start_samples = _selected->get_samples();
+    _deadline = _start_time + (size_t)(max_duration_s * 1e9);
+    _p._experiment_active.store(true);
+    _active = true;
+
+    string r = "{\"line\":\"" + line_to_json_string(_selected) + "\"";
+    r += ",\"start_ns\":" + to_string(_start_time);
+    r += ",\"global_delay_ns\":" + to_string(_start_delay);
+    r += ",\"samples\":" + to_string(_start_samples);
+    if (_start_samples == 0)
+      r += ",\"warning\":\"line has no samples so far; the experiment may have "
+           "no effect\"";
+    r += "}";
+    return coz_control::reply::success(r);
+  }
+
+  coz_control::reply stop() override {
+    if (_active) return coz_control::reply::success(finish(false));
+    if (_has_pending) {
+      _has_pending = false;
+      return coz_control::reply::success(_pending);
+    }
+    return coz_control::reply::failure("no experiment to stop");
+  }
+
+  coz_control::reply latch_stats(bool) override {
+    return coz_control::reply::failure("latch stats not available yet");
+  }
+  coz_control::reply latch_stats_reset() override { return latch_stats(false); }
+  coz_control::reply latch_stats_snapshot() override {
+    return latch_stats(false);
+  }
+
+  /// Auto-stop an experiment that outlived its max duration (e.g. the client
+  /// died).
+  void check_deadline() {
+    if (_active && get_time() >= _deadline) {
+      _pending = finish(true);
+      _has_pending = true;
+    }
+  }
+
+  bool active() const { return _active; }
+
+  string finish(bool auto_stopped) {
+    // Read the counters before deactivating, like the upstream experiment loop.
+    size_t end_time = get_time();
+    size_t delay = _p._global_delay.load() - _start_delay;
+    size_t slowdown = _p._slowdown_total.load() - _start_slowdown;
+    size_t samples = _selected->get_samples() - _start_samples;
+
+    _p._experiment_active.store(false);
+    _p._delay_size.store(0);
+    _p._slowdown_size.store(0);
+    _p._selected_line.store(nullptr);
+    _active = false;
+
+    string r = "{\"line\":\"" + line_to_json_string(_selected) + "\"";
+    r += ",\"kind\":\"" + kind_name() + "\"";
+    r += ",\"percent\":" + to_string(_percent);
+    r += ",\"start_ns\":" + to_string(_start_time);
+    r += ",\"end_ns\":" + to_string(end_time);
+    r += ",\"global_delay_ns_delta\":" + to_string(delay);
+    r += ",\"slowdown_ns_delta\":" + to_string(slowdown);
+    r += ",\"selected_samples\":" + to_string(samples);
+    r += string(",\"auto_stopped\":") + (auto_stopped ? "true" : "false");
+    r += "}";
+
+    _output << "{\"type\":\"manual-experiment\",\"result\":" << r << "}\n";
+    _output.flush();
+    return r;
+  }
+
+ private:
+  string kind_name() const {
+    return _kind == coz_control::experiment_kind::speedup ? "speedup"
+                                                          : "slowdown";
+  }
+
+  profiler& _p;
+  ofstream& _output;
+  bool _active = false;
+  line* _selected = nullptr;
+  coz_control::experiment_kind _kind = coz_control::experiment_kind::speedup;
+  unsigned _percent = 0;
+  size_t _start_time = 0;
+  size_t _start_delay = 0;
+  size_t _start_slowdown = 0;
+  size_t _start_samples = 0;
+  size_t _deadline = 0;
+  bool _has_pending = false;
+  string _pending;
+};
+
+void profiler::control_loop(ofstream& output) {
+  coz_control::server srv;
+  string err;
+  if (!srv.open(_control_socket, err)) {
+    WARNING << "coz-mcp: cannot open control socket: " << err;
+    while (_running) wait(ExperimentCoolOffTime);
+    return;
+  }
+  VERBOSE << "coz-mcp: control socket " << _control_socket;
+
+  control_backend backend(*this, output);
+  while (_running) {
+    srv.poll_once(50, backend);
+    backend.check_deadline();
+  }
+  if (backend.active()) backend.finish(false);
+  srv.close();
 }

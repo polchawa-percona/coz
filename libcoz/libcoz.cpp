@@ -264,6 +264,15 @@ void init_coz(void) {
     (void)profiler::get_instance().get_throughput_point("end-to-end");
   }
 
+  // coz-mcp: runtime control socket ("%p" expands to the process id)
+  string control_socket = getenv_safe("COZ_CONTROL_SOCKET", "");
+  if (!control_socket.empty()) {
+    string::size_type pos = control_socket.find("%p");
+    if (pos != string::npos)
+      control_socket.replace(pos, 2, to_string(getpid()));
+    profiler::get_instance().set_control_socket(control_socket);
+  }
+
   // Start the profiler
   profiler::get_instance().startup(output_file,
                                    fixed_line.get(),
