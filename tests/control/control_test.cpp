@@ -166,7 +166,11 @@ TEST(dispatch_start_validates_arguments) {
       dispatch("{\"cmd\":\"start\",\"line\":\"a.cc:1\",\"kind\":\"speedup\","
                "\"percent\":5,\"max_duration_s\":0}",
                b),
-      std::string("{\"error\":\"max_duration_s must be > 0\"}"));
+      std::string("{\"error\":\"max_duration_s must be > 0 and <= 86400\"}"));
+  ASSERT_TRUE(dispatch("{\"cmd\":\"start\",\"line\":\"a.cc:1\",\"kind\":\"speedup\","
+                       "\"percent\":5,\"max_duration_s\":1e999}",
+                       b)
+                  .find("max_duration_s") != std::string::npos);
   ASSERT_TRUE(b.last != "start");
 }
 

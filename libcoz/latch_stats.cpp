@@ -82,6 +82,7 @@ struct thread_data {
   uint64_t pending_since = 0;
   held_latch held[max_held];
   int depth = 0;
+  uint64_t enable_epoch = 0;
 
   // Read by snapshots.
   std::mutex sites_mutex;    // guards the vector, not the counters
@@ -131,6 +132,13 @@ thread_data* registry::local() {
     gen = g;
     std::lock_guard<std::mutex> lock(_threads_mutex);
     _threads.push_back(td);
+  }
+  uint64_t epoch = _enable_epoch.load(std::memory_order_relaxed);
+  if(td->enable_epoch != epoch) {
+    td->enable_epoch = epoch;
+    td->depth = 0;
+    td->pending_latch = nullptr;
+    td->pending_site = nullptr;
   }
   return td;
 }

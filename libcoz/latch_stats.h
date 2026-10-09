@@ -55,7 +55,12 @@ class registry {
 public:
   static registry& instance();
 
-  void set_enabled(bool on) { _enabled.store(on, std::memory_order_relaxed); }
+  void set_enabled(bool on) {
+    // Turning stats on starts a new epoch: held-latch stacks recorded before
+    // stats were turned off are stale and get dropped (see local()).
+    if(on && !enabled()) _enable_epoch.fetch_add(1, std::memory_order_relaxed);
+    _enabled.store(on, std::memory_order_relaxed);
+  }
   bool enabled() const { return _enabled.load(std::memory_order_relaxed); }
 
   /// Hot path, called by the thread that acquires/releases the latch.
@@ -80,6 +85,7 @@ private:
   std::mutex _threads_mutex;
   std::vector<thread_data*> _threads;    // never freed: stats outlive threads
   std::atomic<uint64_t> _generation{0};  // bumped by clear_for_test
+  std::atomic<uint64_t> _enable_epoch{0};  // bumped when stats are turned on
 };
 
 }  // namespace coz_latch

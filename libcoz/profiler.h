@@ -81,6 +81,19 @@ public:
   /// otherwise debt for samples taken outside locks (call before an acquire).
   void pay_slowdown_slice(bool inside, size_t segment_ns);
 
+  /// coz-mcp: drop slowdown debt left over from an earlier experiment
+  void check_slowdown_epoch(thread_state* state) {
+    size_t epoch = _experiment_epoch.load(std::memory_order_relaxed);
+    if(state->slowdown_epoch != epoch) {
+      state->slowdown_epoch = epoch;
+      state->slowdown_debt_in = 0;
+      state->slowdown_debt_out = 0;
+    }
+  }
+
+  /// coz-mcp: CLOCK_MONOTONIC time at which the current experiment started
+  size_t experiment_start_mono() const { return _experiment_start_mono.load(std::memory_order_relaxed); }
+
   /// coz-mcp: is a slowdown experiment running?
   bool slowdown_active() const { return _slowdown_size.load(std::memory_order_relaxed) > 0; }
 
@@ -344,6 +357,8 @@ private:
   std::atomic<size_t> _slowdown_size{0};   //< Sleep per selected-line sample in a slowdown experiment
   std::atomic<size_t> _slowdown_total{0};  //< Total time slept for slowdown experiments
   bool _lock_aware_delays = false;         //< Defer virtual delays while holding locks
+  std::atomic<size_t> _experiment_epoch{0};       //< Incremented at every manual experiment start
+  std::atomic<size_t> _experiment_start_mono{0};  //< CLOCK_MONOTONIC at experiment start
   uint32_t _sample_event_type = 1;         //< PERF_TYPE_SOFTWARE
   uint64_t _sample_event_config = 1;       //< PERF_COUNT_SW_TASK_CLOCK
   uint64_t _sample_event_period = SamplePeriod;

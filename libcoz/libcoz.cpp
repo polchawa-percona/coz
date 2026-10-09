@@ -81,7 +81,9 @@ static inline uint64_t get_monotonic_time() {
 /// Pay slowdown debt for the code run since the thread last held no lock.
 static inline void pay_slowdown_outside(profiler& p) {
   if(coz_lock_depth == 0 && p.slowdown_active()) {
+    // Never count code that ran before this experiment started.
     size_t since = coz_unlocked_since;
+    if(since < p.experiment_start_mono()) since = p.experiment_start_mono();
     p.pay_slowdown_slice(false, since ? get_monotonic_time() - since : 0);
   }
 }
@@ -111,6 +113,7 @@ static inline void lock_before_release() {
   if(p.lock_aware_delays() && p.slowdown_active() && coz_lock_depth > 0 &&
      coz_lock_depth <= MaxTrackedLocks) {
     size_t since = coz_lock_since[coz_lock_depth - 1];
+    if(since && since < p.experiment_start_mono()) since = p.experiment_start_mono();
     p.pay_slowdown_slice(true, since ? get_monotonic_time() - since : 0);
   }
 }
@@ -202,6 +205,8 @@ static void latch_acquired(const void* latch) {
 }
 
 static void latch_release(const void* latch) {
+  // A wait that never reached acquired() (e.g. a failed nowait acquire).
+  if(initialized) latch_end_wait(false);
   // Catch up first: a slowdown paid here is time the latch is really held.
   lock_before_release();
   coz_latch::registry& r = coz_latch::registry::instance();
@@ -614,7 +619,7 @@ extern "C" {
   int pthread_mutex_unlock(pthread_mutex_t* mutex) {
     lock_before_release();
     int result = real::pthread_mutex_unlock(mutex);
-    lock_after_release(true);
+    if(result == 0) lock_after_release(true);
     return result;
   }
 
@@ -780,7 +785,7 @@ extern "C" {
   int pthread_rwlock_unlock(pthread_rwlock_t* rwlock) {
     lock_before_release();
     int result = real::pthread_rwlock_unlock(rwlock);
-    lock_after_release(true);
+    if(result == 0) lock_after_release(true);
     return result;
   }
 #endif // !__APPLE__

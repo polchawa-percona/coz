@@ -784,6 +784,7 @@ void profiler::process_samples(thread_state* state) {
   // sleeps itself. The sleep is not virtual delay: it is neither credited to
   // local_delay nor added to _global_delay, so no other thread pauses for it.
   size_t slowdown = _slowdown_size.load();
+  check_slowdown_epoch(state);
   if(selected_hits > 0 && slowdown > 0) {
     size_t debt = selected_hits * slowdown;
     if(_lock_aware_delays) {
@@ -987,6 +988,12 @@ void profiler::on_error(int signum, siginfo_t* info, void* p) {
   _exit(2);
 }
 
+static inline size_t monotonic_ns() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (size_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
 /*
  * coz-mcp runtime control. Everything below runs on the profiler thread, so the
  * manual experiment state needs no locking; only the atomics that sampled
@@ -1063,6 +1070,8 @@ public:
     _p._slowdown_size.store(
         kind == coz_control::experiment_kind::slowdown ? size : 0);
 
+    _p._experiment_epoch.fetch_add(1);
+    _p._experiment_start_mono.store(monotonic_ns());
     _start_time = get_time();
     _start_delay = _p._global_delay.load();
     _start_slowdown = _p._slowdown_total.load();
@@ -1169,33 +1178,34 @@ private:
   string _pending;
 };
 
-static inline size_t monotonic_ns() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (size_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
 void profiler::pay_slowdown_slice(bool inside, size_t segment_ns) {
   size_t size = _slowdown_size.load(std::memory_order_relaxed);
   if(size == 0) return;
   thread_state* state = get_thread_state();
   if(!state) return;
+  // Keep the sampling signal handler from touching the debt meanwhile, and
+  // do not sample the spin itself (its callchain may contain the selected line).
+  state->set_in_use(true);
+  check_slowdown_epoch(state);
   size_t& debt = inside ? state->slowdown_debt_in : state->slowdown_debt_out;
-  if(debt == 0) return;
   // percent% of the code segment that just ran; a growing backlog pays faster.
   size_t slice = segment_ns * size / SamplePeriod;
   if(debt > SlowdownBacklog && slice < debt / 64) slice = debt / 64;
   if(slice > debt) slice = debt;
-  if(slice == 0) return;
-  size_t start = monotonic_ns();
-  size_t now = start;
-  while(now - start < slice) {
-    __builtin_ia32_pause();
-    now = monotonic_ns();
+  if(slice > 0) {
+    state->sampler.stop();
+    size_t start = monotonic_ns();
+    size_t now = start;
+    while(now - start < slice) {
+      __builtin_ia32_pause();
+      now = monotonic_ns();
+    }
+    state->sampler.start();
+    size_t paid = now - start;
+    debt -= paid < debt ? paid : debt;
+    _slowdown_total.fetch_add(paid);
   }
-  size_t paid = now - start;
-  debt -= paid < debt ? paid : debt;
-  _slowdown_total.fetch_add(paid);
+  state->set_in_use(false);
 }
 
 #ifndef __APPLE__
@@ -1226,7 +1236,8 @@ static double calibrate_rate(uint32_t type, uint64_t config) {
   // Spin in user space (the counter excludes the kernel); CLOCK_MONOTONIC is
   // read through the vDSO, so the loop never enters the kernel.
   ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-  struct timespec t0, t1;
+  struct timespec t0, t1, c0, c1;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
   clock_gettime(CLOCK_MONOTONIC, &t0);
   volatile uint64_t sink = 0;
   do {
@@ -1234,11 +1245,32 @@ static double calibrate_rate(uint32_t type, uint64_t config) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
   } while((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec) < 20000000L);
   ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+  // Divide by this thread's CPU time, not wall time: if the thread was
+  // preempted while spinning, wall time would underestimate the rate.
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
   uint64_t count = 0;
   bool ok = read(fd, &count, sizeof(count)) == sizeof(count);
   close(fd);
-  double ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
-  return ok && count > 0 ? count / ns : 0;
+  double ns = (c1.tv_sec - c0.tv_sec) * 1e9 + (c1.tv_nsec - c0.tv_nsec);
+  return ok && count > 0 && ns > 0 ? count / ns : 0;
+}
+
+/// Can this thread open a sampling event with the attributes begin_sampling uses?
+static bool can_sample(uint32_t type, uint64_t config, uint64_t period) {
+  struct perf_event_attr pe;
+  memset(&pe, 0, sizeof(pe));
+  pe.size = sizeof(pe);
+  pe.type = type;
+  pe.config = config;
+  pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN;
+  pe.sample_period = period;
+  pe.exclude_idle = 1;
+  pe.exclude_kernel = 1;
+  pe.disabled = 1;
+  int fd = sampling_perf_open(&pe);
+  if(fd < 0) return false;
+  close(fd);
+  return true;
 }
 
 void profiler::set_sample_event(const string& name) {
@@ -1252,7 +1284,7 @@ void profiler::set_sample_event(const string& name) {
     return;  // keep the software task clock
   }
   double rate = calibrate_rate(PERF_TYPE_HARDWARE, config);
-  if(rate <= 0) {
+  if(rate <= 0 || !can_sample(PERF_TYPE_HARDWARE, config, (uint64_t)(rate * SamplePeriod))) {
     WARNING << "coz-mcp: " << name << " not available, sampling with task-clock";
     return;
   }

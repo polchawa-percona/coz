@@ -206,8 +206,8 @@ std::string dispatch_start(const object& req, backend& b) {
 
   double max_duration = default_max_duration_s;
   if(const value* d = find(req, "max_duration_s")) {
-    if(d->kind != value::number_v || !(d->num > 0))
-      return error_json("max_duration_s must be > 0");
+    if(d->kind != value::number_v || !(d->num > 0) || d->num > 86400)
+      return error_json("max_duration_s must be > 0 and <= 86400");
     max_duration = d->num;
   }
   return finish(b.start(line->str, k, (unsigned)pct->num, max_duration));
@@ -343,10 +343,14 @@ void server::accept_client() {
   if(_client_fd >= 0) {
     // One client at a time: refuse the newcomer with an error line.
     static const char busy[] = "{\"error\":\"another client is connected\"}\n";
-    (void)!write(fd, busy, sizeof(busy) - 1);
+    (void)!send(fd, busy, sizeof(busy) - 1, MSG_NOSIGNAL);
     ::close(fd);
     return;
   }
+  // A client that stops reading must not block the profiler thread (and
+  // with it the experiment auto-stop) for long.
+  struct timeval tv = {1, 0};
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   _client_fd = fd;
 }
 
@@ -368,7 +372,8 @@ bool server::read_client(backend& b) {
     const char* p = resp.data();
     size_t left = resp.size();
     while(left > 0) {
-      ssize_t w = write(_client_fd, p, left);
+      // MSG_NOSIGNAL: a client that went away must not kill the target.
+      ssize_t w = send(_client_fd, p, left, MSG_NOSIGNAL);
       if(w < 0 && errno == EINTR) continue;
       if(w <= 0) return false;
       p += w;

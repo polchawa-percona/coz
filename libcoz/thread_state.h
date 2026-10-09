@@ -23,6 +23,7 @@ public:
   int block_depth = 0;                  //< coz-mcp: nesting of pre_block()/post_block() pairs
   size_t slowdown_debt_in = 0;          //< coz-mcp: slowdown owed for samples taken inside a lock
   size_t slowdown_debt_out = 0;         //< coz-mcp: slowdown owed for samples taken outside locks
+  size_t slowdown_epoch = 0;            //< coz-mcp: experiment the debts belong to
 
   inline void set_in_use(bool value) {
     in_use = value;

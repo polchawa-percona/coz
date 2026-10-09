@@ -188,6 +188,19 @@ TEST(histogram_in_snapshot) {
   ASSERT_TRUE(o.find("\"hold_hist\":[0,0,1,") != std::string::npos);
 }
 
+TEST(reenable_drops_stale_held_latches) {
+  registry& r = registry::instance();
+  int a;
+  r.wait_begin(&a, FILE_A, 70, NAME_M, 0, 0);
+  r.acquired(&a, 0);  // held when stats are turned off
+  r.set_enabled(false);
+  r.set_enabled(true);
+  r.release(&a, 1000000);  // stale entry dropped: counted as unmatched
+  std::string snap = r.snapshot_json(2000000);
+  ASSERT_TRUE(field(site_json(snap, "/src/a.cc:70", "mutex"), "hold_count") <= 0);
+  ASSERT_TRUE(field(snap, "unmatched_releases") == 1);
+}
+
 int main() {
   printf("%d/%d latch stats tests passed\n", tests_passed, tests_run);
   return tests_passed == tests_run ? 0 : 1;
