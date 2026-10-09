@@ -725,6 +725,7 @@ void profiler::add_delays(thread_state* state) {
 #else
       // Thread is ahead: increase the global delay time to make other threads pause
       _global_delay.fetch_add(local - global_delay);
+      _dc.pushed_ns.fetch_add(local - global_delay, std::memory_order_relaxed);
 #endif
 
     } else if(local < global_delay) {
@@ -732,12 +733,25 @@ void profiler::add_delays(thread_state* state) {
 
       size_t needed = global_delay - local;
 
+      // coz-mcp: pay from time this thread already over-slept.
+      if(_overshoot_mode == overshoot_mode::bank && state->overshoot_bank > 0) {
+        size_t use = state->overshoot_bank < needed ? state->overshoot_bank : needed;
+        state->overshoot_bank -= use;
+        state->local_delay.fetch_add(use);
+        _dc.banked_used_ns.fetch_add(use, std::memory_order_relaxed);
+        needed -= use;
+        if(needed == 0) return;
+      }
+
       // coz-mcp: a thread that pays virtual delays while holding a lock also
       // stalls every thread waiting for that lock, which a real speedup would
       // never do (waiters skip delays inserted while they were blocked, so this
       // time is never accounted). Defer the payment until the thread holds no
       // lock, but not without bound, or a long lock holder would never pay.
-      if(_lock_aware_delays && coz_lock_depth > 0 && needed < MaxDeferredDelay) return;
+      if(_lock_aware_delays && coz_lock_depth > 0 && needed < MaxDeferredDelay) {
+        _dc.deferred.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
 
       // Pause and record the exact amount of time this thread paused
       state->sampler.stop();
@@ -753,8 +767,22 @@ void profiler::add_delays(thread_state* state) {
       }
       g_delays_applied.fetch_add(1, std::memory_order_relaxed);
 #else
-      state->local_delay.fetch_add(waited);
+      if(_overshoot_mode == overshoot_mode::bank) {
+        // coz-mcp: credit only what was needed. Crediting the overshoot would
+        // put this thread ahead, so every other thread would pause for it and
+        // overshoot in turn: on a 4-thread demo the global delay grew 5.7x
+        // faster than the samples justify, and the result depended on sleep
+        // latency. The overshoot is kept and pays this thread's next delays.
+        state->local_delay.fetch_add(needed);
+        if(waited > needed) state->overshoot_bank += waited - needed;
+      } else {
+        state->local_delay.fetch_add(waited);
+      }
 #endif
+      _dc.pauses.fetch_add(1, std::memory_order_relaxed);
+      _dc.paused_ns.fetch_add(waited, std::memory_order_relaxed);
+      if(waited > needed) _dc.overshoot_ns.fetch_add(waited - needed, std::memory_order_relaxed);
+      if(coz_lock_depth > 0) _dc.paused_in_lock.fetch_add(1, std::memory_order_relaxed);
       state->sampler.start();
     }
 
@@ -777,7 +805,9 @@ void profiler::process_samples(thread_state* state) {
       if(_experiment_active) {
         // Add a delay if the sample is in the selected line
         if(sampled_line.second) {
-          state->local_delay.fetch_add(_delay_size.load());
+          size_t d = _delay_size.load();
+          state->local_delay.fetch_add(d);
+          _dc.sample_credit_ns.fetch_add(d, std::memory_order_relaxed);
           selected_hits++;
         }
 
@@ -1084,6 +1114,7 @@ public:
     _start_delay = _p._global_delay.load();
     _start_slowdown = _p._slowdown_total.load();
     _start_samples = _selected->get_samples();
+    _start_counters = counters();
     _deadline = _start_time + (size_t)(max_duration_s * 1e9);
     _p._experiment_active.store(true);
     _active = true;
@@ -1142,6 +1173,7 @@ public:
     size_t delay = _p._global_delay.load() - _start_delay;
     size_t slowdown = _p._slowdown_total.load() - _start_slowdown;
     size_t samples = _selected->get_samples() - _start_samples;
+    std::vector<size_t> c = counters();
 
     _p._experiment_active.store(false);
     _p._delay_size.store(0);
@@ -1157,6 +1189,12 @@ public:
     r += ",\"global_delay_ns_delta\":" + to_string(delay);
     r += ",\"slowdown_ns_delta\":" + to_string(slowdown);
     r += ",\"selected_samples\":" + to_string(samples);
+    r += ",\"delay_counters\":{";
+    for(size_t i = 0; i < c.size(); i++) {
+      if(i > 0) r += ",";
+      r += string("\"") + counter_name(i) + "\":" + to_string(c[i] - _start_counters[i]);
+    }
+    r += "}";
     r += string(",\"auto_stopped\":") + (auto_stopped ? "true" : "false");
     r += "}";
 
@@ -1166,6 +1204,21 @@ public:
   }
 
 private:
+  static const char* counter_name(size_t i) {
+    static const char* const names[] = {
+        "sample_credit_ns", "pushed_ns", "pauses", "paused_ns", "overshoot_ns",
+        "banked_used_ns", "deferred", "paused_in_lock", "skips", "skipped_ns"};
+    return names[i];
+  }
+
+  std::vector<size_t> counters() const {
+    const profiler::delay_counters& d = _p._dc;
+    return {d.sample_credit_ns.load(), d.pushed_ns.load(), d.pauses.load(),
+            d.paused_ns.load(), d.overshoot_ns.load(), d.banked_used_ns.load(),
+            d.deferred.load(), d.paused_in_lock.load(), d.skips.load(),
+            d.skipped_ns.load()};
+  }
+
   string kind_name() const {
     return _kind == coz_control::experiment_kind::speedup ? "speedup"
                                                           : "slowdown";
@@ -1181,6 +1234,7 @@ private:
   size_t _start_delay = 0;
   size_t _start_slowdown = 0;
   size_t _start_samples = 0;
+  std::vector<size_t> _start_counters;
   size_t _deadline = 0;
   bool _has_pending = false;
   string _pending;
