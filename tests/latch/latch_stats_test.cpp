@@ -201,6 +201,20 @@ TEST(reenable_drops_stale_held_latches) {
   ASSERT_TRUE(field(snap, "unmatched_releases") == 1);
 }
 
+TEST(nested_wait_keeps_outer_wait) {
+  registry& r = registry::instance();
+  int outer, inner;
+  r.wait_begin(&outer, FILE_A, 80, NAME_L, 2, 0);
+  r.wait_begin(&inner, FILE_B, 81, NAME_M, 0, 100);  // e.g. sync array mutex
+  r.acquired(&inner, 150);
+  r.release(&inner, 200);
+  r.acquired(&outer, 1000);
+  r.release(&outer, 1500);
+  std::string snap = r.snapshot_json(5000);
+  ASSERT_TRUE(field(site_json(snap, "/src/a.cc:80", "x"), "wait_ns") == 1000);
+  ASSERT_TRUE(field(site_json(snap, "/src/b.cc:81", "mutex"), "wait_ns") == 50);
+}
+
 int main() {
   printf("%d/%d latch stats tests passed\n", tests_passed, tests_run);
   return tests_passed == tests_run ? 0 : 1;

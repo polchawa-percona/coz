@@ -160,27 +160,39 @@ extern "C" void _coz_post_block(int skip_delays) {
 /*
  * coz-mcp latch hooks (COZ_LATCH_* in coz.h). Each hook first lets the thread
  * catch up on Coz delays, so slowdown sleeps for samples taken inside a
- * critical section are paid before the latch is released. catch_up() looks up
- * the thread state with a gettid() syscall, so it only runs during
- * experiments.
+ * critical section are paid before the latch is released. catch_up() only
+ * runs during experiments.
+ *
+ * Waits can nest: InnoDB acquires a mutex while waiting for another latch
+ * (sync array cell reservation). Each pending wait is kept on a small stack;
+ * acquired() pops its own wait and any waits above it, which were abandoned
+ * (e.g. a nowait attempt that failed).
  */
-/// True between a latch wait_begin and acquired while the thread counts as
-/// blocked for Coz.
-static __thread bool coz_latch_waiting __attribute__((tls_model("initial-exec"))) = false;
+struct latch_wait {
+  const void* latch;
+  bool blocked;  // pre_block() was called for this wait
+};
+static constexpr int MaxLatchWaits = 8;
+static __thread latch_wait coz_latch_waits[MaxLatchWaits] __attribute__((tls_model("initial-exec")));
+static __thread int coz_latch_wait_depth __attribute__((tls_model("initial-exec"))) = 0;
 
-static inline void latch_end_wait(bool skip_delays) {
-  if(coz_latch_waiting) {
-    coz_latch_waiting = false;
-    profiler::get_instance().post_block(skip_delays);
+static inline void latch_end_wait(const void* latch) {
+  for(int i = coz_latch_wait_depth - 1; i >= 0; i--) {
+    if(coz_latch_waits[i].latch != latch) continue;
+    // Abandoned waits above the matched one end without skipping delays.
+    for(int j = coz_latch_wait_depth - 1; j >= i; j--) {
+      if(coz_latch_waits[j].blocked) profiler::get_instance().post_block(j == i);
+    }
+    coz_latch_wait_depth = i;
+    return;
   }
 }
 
 static void latch_wait_begin(const void* latch, const char* file, int line,
                              const char* name, int mode) {
   if(initialized) {
-    // A wait that never reached acquired() (e.g. a failed trylock).
-    latch_end_wait(false);
     profiler& p = profiler::get_instance();
+    bool blocked = false;
     if(p.experiment_active()) {
       p.catch_up();
       if(p.lock_aware_delays()) {
@@ -189,8 +201,13 @@ static void latch_wait_begin(const void* latch, const char* file, int line,
         // holder, like a pthread_mutex_lock caller: it must not pay virtual
         // delays inserted while it waited, or it would delay the handoff.
         p.pre_block();
-        coz_latch_waiting = true;
+        blocked = true;
       }
+    }
+    if(coz_latch_wait_depth < MaxLatchWaits) {
+      coz_latch_waits[coz_latch_wait_depth++] = {latch, blocked};
+    } else if(blocked) {
+      p.post_block(false);  // too deep to track: do not stay blocked
     }
   }
   coz_latch::registry& r = coz_latch::registry::instance();
@@ -199,14 +216,12 @@ static void latch_wait_begin(const void* latch, const char* file, int line,
 
 static void latch_acquired(const void* latch) {
   lock_after_acquire();
-  if(initialized) latch_end_wait(true);
+  if(initialized) latch_end_wait(latch);
   coz_latch::registry& r = coz_latch::registry::instance();
   if(r.enabled()) r.acquired(latch, get_monotonic_time());
 }
 
 static void latch_release(const void* latch) {
-  // A wait that never reached acquired() (e.g. a failed nowait acquire).
-  if(initialized) latch_end_wait(false);
   // Catch up first: a slowdown paid here is time the latch is really held.
   lock_before_release();
   coz_latch::registry& r = coz_latch::registry::instance();

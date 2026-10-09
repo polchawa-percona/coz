@@ -565,9 +565,15 @@ void profiler::shutdown() {
   }
 }
 
+/// coz-mcp: this thread's state, cached so that latch hooks and lock wrappers
+/// do not pay a gettid() syscall per call (initial-exec TLS is safe in the
+/// sampling signal handler).
+static __thread thread_state* tls_thread_state __attribute__((tls_model("initial-exec"))) = nullptr;
+
 thread_state* profiler::add_thread() {
   pid_t tid = gettid();
   thread_state* inserted = _thread_states.insert(tid);
+  tls_thread_state = inserted;
   if (inserted != nullptr) {
     _num_threads_running += 1;
     VERBOSE << "Registered thread tid=" << tid;
@@ -576,10 +582,12 @@ thread_state* profiler::add_thread() {
 }
 
 thread_state* profiler::get_thread_state() {
+  if(tls_thread_state) return tls_thread_state;
   return _thread_states.find(gettid());
 }
 
 void profiler::remove_thread() {
+  tls_thread_state = nullptr;
   _thread_states.remove(gettid());
   _num_threads_running -= 1;
 }

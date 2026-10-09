@@ -24,7 +24,8 @@ namespace coz_latch {
 constexpr int hist_buckets = 40;
 
 /// Maximum latches one thread can hold at once before releases are lost.
-constexpr int max_held = 64;
+/// InnoDB threads can hold more than 64 (e.g. many page latches).
+constexpr int max_held = 256;
 
 int bucket_of(uint64_t ns);
 

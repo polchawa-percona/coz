@@ -77,9 +77,14 @@ struct held_latch {
 struct thread_data {
   // Owner thread only.
   std::unordered_map<site_key, site*, site_key_hash> index;
-  const void* pending_latch = nullptr;
-  site* pending_site = nullptr;
-  uint64_t pending_since = 0;
+  // Pending waits (nested waits happen, e.g. a mutex taken while waiting for
+  // another latch); acquired() pops its wait and abandoned waits above it.
+  struct pending_wait {
+    const void* latch;
+    site* s;
+    uint64_t since;
+  } pending[8];
+  int npending = 0;
   held_latch held[max_held];
   int depth = 0;
   uint64_t enable_epoch = 0;
@@ -137,8 +142,7 @@ thread_data* registry::local() {
   if(td->enable_epoch != epoch) {
     td->enable_epoch = epoch;
     td->depth = 0;
-    td->pending_latch = nullptr;
-    td->pending_site = nullptr;
+    td->npending = 0;
   }
   return td;
 }
@@ -147,20 +151,25 @@ void registry::wait_begin(const void* latch, const char* file, int line,
                           const char* name, int mode, uint64_t now_ns) {
   if(!enabled()) return;
   thread_data* td = local();
-  td->pending_latch = latch;
-  td->pending_site = td->lookup(file, line, name, mode);
-  td->pending_since = now_ns;
+  if(td->npending == 8) {
+    // Too deep: drop the oldest wait.
+    for(int i = 1; i < 8; i++) td->pending[i - 1] = td->pending[i];
+    td->npending--;
+  }
+  td->pending[td->npending++] = {latch, td->lookup(file, line, name, mode), now_ns};
 }
 
 void registry::acquired(const void* latch, uint64_t now_ns) {
   if(!enabled()) return;
   thread_data* td = local();
-  if(td->pending_latch != latch || td->pending_site == nullptr) return;
-  site* s = td->pending_site;
-  td->pending_latch = nullptr;
-  td->pending_site = nullptr;
+  int i = td->npending - 1;
+  while(i >= 0 && td->pending[i].latch != latch) i--;
+  if(i < 0) return;
+  site* s = td->pending[i].s;
+  uint64_t since = td->pending[i].since;
+  td->npending = i;
 
-  uint64_t wait = now_ns >= td->pending_since ? now_ns - td->pending_since : 0;
+  uint64_t wait = now_ns >= since ? now_ns - since : 0;
   add(s->c.count, 1);
   add(s->c.wait_ns, wait);
   max_of(s->c.wait_max_ns, wait);
