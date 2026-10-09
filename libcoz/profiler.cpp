@@ -31,6 +31,10 @@
 #include <limits.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <linux/perf_event.h>
 
 #include <algorithm>
 #include <atomic>
@@ -611,10 +615,10 @@ void profiler::begin_sampling(thread_state* state) {
   // Set the perf_event sampler configuration (Linux)
   struct perf_event_attr pe;
   memset(&pe, 0, sizeof(pe));
-  pe.type = PERF_TYPE_SOFTWARE;
-  pe.config = PERF_COUNT_SW_TASK_CLOCK;
+  pe.type = _sample_event_type;
+  pe.config = _sample_event_config;
   pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN;
-  pe.sample_period = SamplePeriod;
+  pe.sample_period = _sample_event_period;
   pe.wakeup_events = SampleBatchSize; // This is ignored on linux 3.13 (why?)
   pe.exclude_idle = 1;
   pe.exclude_kernel = 1;
@@ -718,8 +722,16 @@ void profiler::add_delays(thread_state* state) {
     } else if(local < global_delay) {
       // Thread is behind: Pause this thread to catch up
 
-      // Pause and record the exact amount of time this thread paused
       size_t needed = global_delay - local;
+
+      // coz-mcp: a thread that pays virtual delays while holding a lock also
+      // stalls every thread waiting for that lock, which a real speedup would
+      // never do (waiters skip delays inserted while they were blocked, so this
+      // time is never accounted). Defer the payment until the thread holds no
+      // lock, but not without bound, or a long lock holder would never pay.
+      if(_lock_aware_delays && coz_lock_depth > 0 && needed < MaxDeferredDelay) return;
+
+      // Pause and record the exact amount of time this thread paused
       state->sampler.stop();
       size_t waited = wait(needed);
 #ifdef __APPLE__
@@ -771,9 +783,32 @@ void profiler::process_samples(thread_state* state) {
   // coz-mcp slowdown: this thread really runs the selected line slower, so it
   // sleeps itself. The sleep is not virtual delay: it is neither credited to
   // local_delay nor added to _global_delay, so no other thread pauses for it.
-  if(selected_hits > 0) {
-    size_t slowdown = _slowdown_size.load();
-    if(slowdown > 0) _slowdown_total.fetch_add(wait(selected_hits * slowdown));
+  size_t slowdown = _slowdown_size.load();
+  if(selected_hits > 0 && slowdown > 0) {
+    size_t debt = selected_hits * slowdown;
+    if(_lock_aware_delays) {
+      // Samples arrive about once per millisecond, so paying the whole debt
+      // at once would add one long stall per sample instead of making each
+      // execution of the line a little slower, which changes how threads
+      // contend for locks. Keep the debt and pay it in short spins at lock
+      // transitions (pay_slowdown_slice); samples drained while a lock is
+      // held were taken inside the critical section.
+      if(coz_lock_depth > 0)
+        state->slowdown_debt_in += debt;
+      else
+        state->slowdown_debt_out += debt;
+    } else {
+      _slowdown_total.fetch_add(wait(debt));
+    }
+  }
+  // Code that never crosses a lock transition: pay the backlog in one sleep.
+  if(state->slowdown_debt_out >= MaxDeferredDelay && coz_lock_depth == 0) {
+    _slowdown_total.fetch_add(wait(state->slowdown_debt_out));
+    state->slowdown_debt_out = 0;
+  }
+  if(state->slowdown_debt_in >= MaxDeferredDelay && coz_lock_depth > 0) {
+    _slowdown_total.fetch_add(wait(state->slowdown_debt_in));
+    state->slowdown_debt_in = 0;
   }
 
   add_delays(state);
@@ -974,6 +1009,8 @@ public:
     r += ",\"global_delay_ns\":" + to_string(_p._global_delay.load());
     r += ",\"slowdown_ns\":" + to_string(_p._slowdown_total.load());
     r += ",\"threads\":" + to_string(_p._num_threads_running.load());
+    r += ",\"sample_event\":\"" + _p._sample_event_name + "\"";
+    r += ",\"sample_event_period\":" + to_string(_p._sample_event_period);
     r += ",\"now_ns\":" + to_string(get_time());
     r += "}";
     return coz_control::reply::success(r);
@@ -1131,6 +1168,102 @@ private:
   bool _has_pending = false;
   string _pending;
 };
+
+static inline size_t monotonic_ns() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (size_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+void profiler::pay_slowdown_slice(bool inside, size_t segment_ns) {
+  size_t size = _slowdown_size.load(std::memory_order_relaxed);
+  if(size == 0) return;
+  thread_state* state = get_thread_state();
+  if(!state) return;
+  size_t& debt = inside ? state->slowdown_debt_in : state->slowdown_debt_out;
+  if(debt == 0) return;
+  // percent% of the code segment that just ran; a growing backlog pays faster.
+  size_t slice = segment_ns * size / SamplePeriod;
+  if(debt > SlowdownBacklog && slice < debt / 64) slice = debt / 64;
+  if(slice > debt) slice = debt;
+  if(slice == 0) return;
+  size_t start = monotonic_ns();
+  size_t now = start;
+  while(now - start < slice) {
+    __builtin_ia32_pause();
+    now = monotonic_ns();
+  }
+  size_t paid = now - start;
+  debt -= paid < debt ? paid : debt;
+  _slowdown_total.fetch_add(paid);
+}
+
+#ifndef __APPLE__
+/*
+ * coz-mcp: choose the perf event that drives sampling. The software task
+ * clock (upstream default) under-samples code that runs just before a thread
+ * blocks or hands over a lock: on a lock-bound demo it attributed 5% of the
+ * samples to the critical section that took 26% of the CPU time (hardware
+ * cycles and ref-cycles agree on 26%). ref-cycles count at a constant rate
+ * while the thread runs, so a period of rate * SamplePeriod keeps one sample
+ * worth SamplePeriod of CPU time, which the delay sizes assume.
+ */
+static long sampling_perf_open(struct perf_event_attr* pe) {
+  return syscall(__NR_perf_event_open, pe, 0, -1, -1, 0);
+}
+
+/// Count `config` while spinning for 20ms; returns events per nanosecond.
+static double calibrate_rate(uint32_t type, uint64_t config) {
+  struct perf_event_attr pe;
+  memset(&pe, 0, sizeof(pe));
+  pe.size = sizeof(pe);
+  pe.type = type;
+  pe.config = config;
+  pe.exclude_kernel = 1;
+  pe.disabled = 1;
+  int fd = sampling_perf_open(&pe);
+  if(fd < 0) return 0;
+  // Spin in user space (the counter excludes the kernel); CLOCK_MONOTONIC is
+  // read through the vDSO, so the loop never enters the kernel.
+  ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  volatile uint64_t sink = 0;
+  do {
+    for(int i = 0; i < 10000; i++) sink = sink * 31 + i;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+  } while((t1.tv_sec - t0.tv_sec) * 1000000000L + (t1.tv_nsec - t0.tv_nsec) < 20000000L);
+  ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+  uint64_t count = 0;
+  bool ok = read(fd, &count, sizeof(count)) == sizeof(count);
+  close(fd);
+  double ns = (t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec);
+  return ok && count > 0 ? count / ns : 0;
+}
+
+void profiler::set_sample_event(const string& name) {
+  uint64_t config;
+  if(name == "ref-cycles") {
+    config = PERF_COUNT_HW_REF_CPU_CYCLES;
+  } else if(name == "cycles") {
+    config = PERF_COUNT_HW_CPU_CYCLES;
+  } else {
+    if(name != "task-clock") WARNING << "coz-mcp: unknown COZ_SAMPLE_EVENT " << name;
+    return;  // keep the software task clock
+  }
+  double rate = calibrate_rate(PERF_TYPE_HARDWARE, config);
+  if(rate <= 0) {
+    WARNING << "coz-mcp: " << name << " not available, sampling with task-clock";
+    return;
+  }
+  _sample_event_type = PERF_TYPE_HARDWARE;
+  _sample_event_config = config;
+  _sample_event_period = (uint64_t)(rate * SamplePeriod);
+  _sample_event_name = name;
+}
+#else
+void profiler::set_sample_event(const string&) {}
+#endif
 
 void profiler::control_loop(ofstream& output) {
   coz_control::server srv;

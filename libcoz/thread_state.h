@@ -20,7 +20,10 @@ public:
   timer process_timer;      //< The timer that triggers sample processing for this thread
   size_t pre_block_time;    //< The time saved before (possibly) blocking
   std::atomic<bool> is_blocked{false};  //< True between pre_block() and post_block(); skip delays
-  
+  int block_depth = 0;                  //< coz-mcp: nesting of pre_block()/post_block() pairs
+  size_t slowdown_debt_in = 0;          //< coz-mcp: slowdown owed for samples taken inside a lock
+  size_t slowdown_debt_out = 0;         //< coz-mcp: slowdown owed for samples taken outside locks
+
   inline void set_in_use(bool value) {
     in_use = value;
     std::atomic_signal_fence(std::memory_order_seq_cst);

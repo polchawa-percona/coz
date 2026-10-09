@@ -44,6 +44,85 @@ main_fn_t real_main;
 
 static bool end_to_end = false;
 bool initialized = false;
+
+__thread int coz_lock_depth __attribute__((tls_model("initial-exec"))) = 0;
+
+/*
+ * coz-mcp lock-aware delays (COZ_LOCK_AWARE_DELAYS, on by default with
+ * COZ_CONTROL_SOCKET). Rules:
+ * - before acquiring a lock, catch up: delays and slowdown debt from samples
+ *   taken so far are paid outside the new critical section;
+ * - while the thread holds a lock, virtual delays are deferred (add_delays);
+ *   slowdown sleeps are not, because samples processed then were taken inside
+ *   the critical section;
+ * - before releasing, catch up again (slowdown sleeps for samples in the
+ *   critical section, delay credit published before waiters wake up);
+ * - after the last lock is released, pay the deferred delays.
+ * With the option off, the pthread wrappers behave exactly like upstream Coz.
+ */
+/*
+ * Slowdown debt is paid in proportion to the code it belongs to: before a
+ * release, percent% of the time this lock was held; before an outermost
+ * acquire, percent% of the time since the thread last held no lock. Each
+ * execution of a slowed critical section thus becomes a little longer, as it
+ * would with really slower code, instead of a few executions becoming much
+ * longer. The sampled debt still caps the total.
+ */
+static constexpr int MaxTrackedLocks = 64;
+static __thread size_t coz_lock_since[MaxTrackedLocks] __attribute__((tls_model("initial-exec")));
+static __thread size_t coz_unlocked_since __attribute__((tls_model("initial-exec"))) = 0;
+
+static inline uint64_t get_monotonic_time() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/// Pay slowdown debt for the code run since the thread last held no lock.
+static inline void pay_slowdown_outside(profiler& p) {
+  if(coz_lock_depth == 0 && p.slowdown_active()) {
+    size_t since = coz_unlocked_since;
+    p.pay_slowdown_slice(false, since ? get_monotonic_time() - since : 0);
+  }
+}
+
+static inline void lock_before_acquire() {
+  if(!initialized) return;
+  profiler& p = profiler::get_instance();
+  if(p.lock_aware_delays() && p.experiment_active()) {
+    p.catch_up();
+    pay_slowdown_outside(p);
+  }
+}
+
+static inline void lock_after_acquire() {
+  if(coz_lock_depth < MaxTrackedLocks) {
+    coz_lock_since[coz_lock_depth] =
+        initialized && profiler::get_instance().slowdown_active() ? get_monotonic_time() : 0;
+  }
+  coz_lock_depth++;
+}
+
+static inline void lock_before_release() {
+  if(!initialized) return;
+  profiler& p = profiler::get_instance();
+  if(!p.experiment_active()) return;
+  p.catch_up();
+  if(p.lock_aware_delays() && p.slowdown_active() && coz_lock_depth > 0 &&
+     coz_lock_depth <= MaxTrackedLocks) {
+    size_t since = coz_lock_since[coz_lock_depth - 1];
+    p.pay_slowdown_slice(true, since ? get_monotonic_time() - since : 0);
+  }
+}
+
+static inline void lock_after_release(bool pay_deferred) {
+  if(coz_lock_depth > 0) coz_lock_depth--;
+  if(coz_lock_depth > 0 || !initialized) return;
+  profiler& p = profiler::get_instance();
+  if(p.slowdown_active()) coz_unlocked_since = get_monotonic_time();
+  // Pay virtual delays deferred while the lock was held.
+  if(pay_deferred && p.lock_aware_delays()) p.catch_up_if_active();
+}
 static bool init_in_progress = false;
 
 /**
@@ -82,35 +161,54 @@ extern "C" void _coz_post_block(int skip_delays) {
  * the thread state with a gettid() syscall, so it only runs during
  * experiments.
  */
-static inline uint64_t get_monotonic_time() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
+/// True between a latch wait_begin and acquired while the thread counts as
+/// blocked for Coz.
+static __thread bool coz_latch_waiting __attribute__((tls_model("initial-exec"))) = false;
 
-static inline void latch_catch_up() {
-  if(initialized && profiler::get_instance().experiment_active()) {
-    profiler::get_instance().catch_up();
+static inline void latch_end_wait(bool skip_delays) {
+  if(coz_latch_waiting) {
+    coz_latch_waiting = false;
+    profiler::get_instance().post_block(skip_delays);
   }
 }
 
 static void latch_wait_begin(const void* latch, const char* file, int line,
                              const char* name, int mode) {
-  latch_catch_up();
+  if(initialized) {
+    // A wait that never reached acquired() (e.g. a failed trylock).
+    latch_end_wait(false);
+    profiler& p = profiler::get_instance();
+    if(p.experiment_active()) {
+      p.catch_up();
+      if(p.lock_aware_delays()) {
+        pay_slowdown_outside(p);
+        // A thread waiting for a latch (spinning or sleeping) is woken by the
+        // holder, like a pthread_mutex_lock caller: it must not pay virtual
+        // delays inserted while it waited, or it would delay the handoff.
+        p.pre_block();
+        coz_latch_waiting = true;
+      }
+    }
+  }
   coz_latch::registry& r = coz_latch::registry::instance();
   if(r.enabled()) r.wait_begin(latch, file, line, name, mode, get_monotonic_time());
 }
 
 static void latch_acquired(const void* latch) {
+  lock_after_acquire();
+  if(initialized) latch_end_wait(true);
   coz_latch::registry& r = coz_latch::registry::instance();
   if(r.enabled()) r.acquired(latch, get_monotonic_time());
 }
 
 static void latch_release(const void* latch) {
   // Catch up first: a slowdown paid here is time the latch is really held.
-  latch_catch_up();
+  lock_before_release();
   coz_latch::registry& r = coz_latch::registry::instance();
   if(r.enabled()) r.release(latch, get_monotonic_time());
+  // The latch is still held until the caller releases it, so deferred virtual
+  // delays are left for the next drain (next acquire or sample batch).
+  lock_after_release(false);
 }
 
 extern "C" coz_latch_api_t* _coz_get_latch_api() {
@@ -316,6 +414,10 @@ void init_coz(void) {
       control_socket.replace(pos, 2, to_string(getpid()));
     profiler::get_instance().set_control_socket(control_socket);
   }
+  profiler::get_instance().set_sample_event(
+      getenv_safe("COZ_SAMPLE_EVENT", control_socket.empty() ? "task-clock" : "ref-cycles"));
+  profiler::get_instance().set_lock_aware_delays(
+      getenv_safe("COZ_LOCK_AWARE_DELAYS", control_socket.empty() ? "0" : "1") == "1");
 
   // Start the profiler
   profiler::get_instance().startup(output_file,
@@ -492,17 +594,28 @@ extern "C" {
 
   /// Skip any global delays added while blocked on a mutex
   int pthread_mutex_lock(pthread_mutex_t* mutex) {
+    lock_before_acquire();
     if(initialized) profiler::get_instance().pre_block();
     int result = real::pthread_mutex_lock(mutex);
+    if(result == 0) lock_after_acquire();
     if(initialized) profiler::get_instance().post_block(true);
 
     return result;
   }
 
+  /// coz-mcp: track lock depth for lock-aware delays
+  int pthread_mutex_trylock(pthread_mutex_t* mutex) {
+    int result = real::pthread_mutex_trylock(mutex);
+    if(result == 0) lock_after_acquire();
+    return result;
+  }
+
   /// Catch up on delays before unblocking any threads waiting on a mutex
   int pthread_mutex_unlock(pthread_mutex_t* mutex) {
-    if(initialized) profiler::get_instance().catch_up();
-    return real::pthread_mutex_unlock(mutex);
+    lock_before_release();
+    int result = real::pthread_mutex_unlock(mutex);
+    lock_after_release(true);
+    return result;
   }
 
   /**
@@ -629,36 +742,46 @@ extern "C" {
   }
 
   int pthread_rwlock_rdlock(pthread_rwlock_t* rwlock) {
+    lock_before_acquire();
     if(initialized) profiler::get_instance().pre_block();
     int result = real::pthread_rwlock_rdlock(rwlock);
+    if(result == 0) lock_after_acquire();
     if(initialized) profiler::get_instance().post_block(true);
     return result;
   }
 
   int pthread_rwlock_timedrdlock(pthread_rwlock_t* rwlock, const struct timespec* abstime) {
+    lock_before_acquire();
     if(initialized) profiler::get_instance().pre_block();
     int result = real::pthread_rwlock_timedrdlock(rwlock, abstime);
+    if(result == 0) lock_after_acquire();
     if(initialized) profiler::get_instance().post_block(result == 0);
     return result;
   }
 
   int pthread_rwlock_wrlock(pthread_rwlock_t* rwlock) {
+    lock_before_acquire();
     if(initialized) profiler::get_instance().pre_block();
     int result = real::pthread_rwlock_wrlock(rwlock);
+    if(result == 0) lock_after_acquire();
     if(initialized) profiler::get_instance().post_block(true);
     return result;
   }
 
   int pthread_rwlock_timedwrlock(pthread_rwlock_t* rwlock, const struct timespec* abstime) {
+    lock_before_acquire();
     if(initialized) profiler::get_instance().pre_block();
     int result = real::pthread_rwlock_timedwrlock(rwlock, abstime);
+    if(result == 0) lock_after_acquire();
     if(initialized) profiler::get_instance().post_block(result == 0);
     return result;
   }
 
   int pthread_rwlock_unlock(pthread_rwlock_t* rwlock) {
-    if(initialized) profiler::get_instance().catch_up();
-    return real::pthread_rwlock_unlock(rwlock);
+    lock_before_release();
+    int result = real::pthread_rwlock_unlock(rwlock);
+    lock_after_release(true);
+    return result;
   }
 #endif // !__APPLE__
 

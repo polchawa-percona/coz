@@ -27,6 +27,10 @@
 #include "ccutil/spinlock.h"
 #include "ccutil/static_map.h"
 
+/// coz-mcp: number of locks (pthread or COZ_LATCH_*) the current thread holds.
+/// initial-exec TLS so that the sampling signal handler can read it safely.
+extern __thread int coz_lock_depth __attribute__((tls_model("initial-exec")));
+
 /// Type of a thread entry function
 typedef void* (*thread_fn_t)(void*);
 
@@ -40,14 +44,16 @@ extern "C" int coz_orig_pthread_create(pthread_t*, const pthread_attr_t*,
 typedef int (*main_fn_t)(int, char**, char**);
 
 enum {
-  SampleSignal = SIGPROF, //< Signal to generate when samples are ready
-  SamplePeriod = 1000000, //< Time between samples (1ms)
-  SampleBatchSize = 10,   //< Samples to batch together for one processing run
-  SpeedupDivisions = 20,  //< How many different speedups to try (20 = 5% increments)
-  ZeroSpeedupWeight = 7,  //< Weight of speedup=0 versus other speedup values (7 = ~25% of experiments run with zero speedup)
-  ExperimentMinTime = SamplePeriod * SampleBatchSize * 50,   //< Minimum experiment length (500ms)
-  ExperimentCoolOffTime = SamplePeriod * SampleBatchSize,    //< Time to wait after an experiment
-  ExperimentTargetDelta = 5 //< Target minimum number of visits to a progress point during an experiment
+  SampleSignal = SIGPROF,                                   //< Signal to generate when samples are ready
+  SamplePeriod = 1000000,                                   //< Time between samples (1ms)
+  SampleBatchSize = 10,                                     //< Samples to batch together for one processing run
+  SpeedupDivisions = 20,                                    //< How many different speedups to try (20 = 5% increments)
+  ZeroSpeedupWeight = 7,                                    //< Weight of speedup=0 versus other speedup values (7 = ~25% of experiments run with zero speedup)
+  ExperimentMinTime = SamplePeriod * SampleBatchSize * 50,  //< Minimum experiment length (500ms)
+  ExperimentCoolOffTime = SamplePeriod * SampleBatchSize,   //< Time to wait after an experiment
+  ExperimentTargetDelta = 5,                                //< Target minimum number of visits to a progress point during an experiment
+  MaxDeferredDelay = 20000000,                              //< coz-mcp: longest virtual delay deferred while a lock is held (20ms)
+  SlowdownBacklog = 2000000                                 //< coz-mcp: above this debt, pay 1/64 of it per transition
 };
 
 /**
@@ -65,6 +71,27 @@ struct thread_start_arg {
 void init_coz(void);
 class profiler {
 public:
+  /// coz-mcp: catch up on delays only when an experiment runs (avoids gettid())
+  void catch_up_if_active() {
+    if(_experiment_active.load(std::memory_order_relaxed)) catch_up();
+  }
+
+  /// coz-mcp: pay part of this thread's slowdown debt by spinning. inside:
+  /// debt for samples taken while holding a lock (call before a release),
+  /// otherwise debt for samples taken outside locks (call before an acquire).
+  void pay_slowdown_slice(bool inside, size_t segment_ns);
+
+  /// coz-mcp: is a slowdown experiment running?
+  bool slowdown_active() const { return _slowdown_size.load(std::memory_order_relaxed) > 0; }
+
+  /// coz-mcp: perf event that drives sampling ("task-clock", "ref-cycles" or
+  /// "cycles"). Call before startup().
+  void set_sample_event(const std::string& name);
+
+  /// coz-mcp: defer virtual delay payments while the thread holds a lock
+  void set_lock_aware_delays(bool on) { _lock_aware_delays = on; }
+  bool lock_aware_delays() const { return _lock_aware_delays; }
+
   /// coz-mcp: is an experiment running? (cheap check for latch hooks)
   bool experiment_active() const { return _experiment_active.load(std::memory_order_relaxed); }
 
@@ -198,6 +225,10 @@ public:
     if(!state)
       return;
 
+    // coz-mcp: only the outermost pair counts (a latch wait may contain an
+    // interposed condition variable wait).
+    if(state->block_depth++ > 0) return;
+
     state->is_blocked.store(true);
     state->pre_block_time = _global_delay.load();
   }
@@ -207,6 +238,8 @@ public:
     thread_state* state = get_thread_state();
     if(!state)
       return;
+
+    if(state->block_depth == 0 || --state->block_depth > 0) return;
 
     state->set_in_use(true);
 
@@ -310,6 +343,11 @@ private:
   std::string _control_socket;             //< Control socket path; empty = upstream behaviour
   std::atomic<size_t> _slowdown_size{0};   //< Sleep per selected-line sample in a slowdown experiment
   std::atomic<size_t> _slowdown_total{0};  //< Total time slept for slowdown experiments
+  bool _lock_aware_delays = false;         //< Defer virtual delays while holding locks
+  uint32_t _sample_event_type = 1;         //< PERF_TYPE_SOFTWARE
+  uint64_t _sample_event_config = 1;       //< PERF_COUNT_SW_TASK_CLOCK
+  uint64_t _sample_event_period = SamplePeriod;
+  std::string _sample_event_name = "task-clock";
 };
 
 #endif
